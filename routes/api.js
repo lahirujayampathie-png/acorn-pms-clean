@@ -866,15 +866,15 @@ router.get('/export/mid-year-appraisal-summary', requireHR, (req, res) => {
 
   const out = [];
   out.push(csvRow(['Emp No','Name','Designation','Grade','Company','Manager',
-    'Overall Score','System Rating','Override Rating','Final Rating',
-    'Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
+    'System Rating','Override Rating','Final Rating',
+    'Overall Score','Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
     'Manager Comments','Manager Strengths','Manager Development',
     'Self Submitted','Manager Submitted','Promotion Recommended']));
   rows.forEach(r => {
     out.push(csvRow([
       r.emp_no, r.name, r.designation, r.grade, r.company, r.manager,
-      r.overall_score || '', r.system_rating || '', r.override_rating || '', r.final_rating || '',
-      r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
+      r.system_rating || '', r.override_rating || '', r.final_rating || '',
+      r.overall_score || '', r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
       r.mgr_comments || '', r.mgr_strengths || '', r.mgr_develop || '',
       r.self_submitted_at ? new Date(r.self_submitted_at*1000).toISOString().slice(0,10) : '',
       r.mgr_submitted_at  ? new Date(r.mgr_submitted_at*1000).toISOString().slice(0,10)  : '',
@@ -904,15 +904,15 @@ router.get('/export/year-end-appraisal-summary', requireHR, (req, res) => {
 
   const out = [];
   out.push(csvRow(['Emp No','Name','Designation','Grade','Company','Manager',
-    'Overall Score','System Rating','Override Rating','Final Rating',
-    'Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
+    'System Rating','Override Rating','Final Rating',
+    'Overall Score','Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
     'Manager Comments','Manager Strengths','Manager Development',
     'Self Submitted','Manager Submitted','Promotion Recommended','Promotion Justification']));
   rows.forEach(r => {
     out.push(csvRow([
       r.emp_no, r.name, r.designation, r.grade, r.company, r.manager,
-      r.overall_score || '', r.system_rating || '', r.override_rating || '', r.final_rating || '',
-      r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
+      r.system_rating || '', r.override_rating || '', r.final_rating || '',
+      r.overall_score || '', r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
       r.mgr_comments || '', r.mgr_strengths || '', r.mgr_develop || '',
       r.self_submitted_at ? new Date(r.self_submitted_at*1000).toISOString().slice(0,10) : '',
       r.mgr_submitted_at  ? new Date(r.mgr_submitted_at*1000).toISOString().slice(0,10)  : '',
@@ -1009,6 +1009,45 @@ router.get('/export/employee-directory', requireHR, (req, res) => {
 });
 
 // GET /api/reports/grading-data — JSON for the reports page grading table
+// GET /api/reports/goal-drill?company=X
+router.get('/reports/goal-drill', requireHR, (req, res) => {
+  const { company } = req.query;
+  if (!company) return res.status(400).json({ error: 'company required' });
+  const rows = db.prepare(`
+    SELECT u.emp_no, u.name, u.designation, u.grade,
+           m.name as manager,
+           gs.status as goal_status,
+           gs.submitted_at, gs.approved_at
+    FROM users u
+    LEFT JOIN users m ON u.reports_to = m.emp_no
+    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+    WHERE u.is_active = 1 AND u.company = ?
+    ORDER BY u.name
+  `).all(CYCLE, company);
+  res.json(rows);
+});
+
+// GET /api/reports/company-drill?company=X&phase=mid_year|year_end
+router.get('/reports/company-drill', requireHR, (req, res) => {
+  const { company, phase } = req.query;
+  if (!company || !phase) return res.status(400).json({ error: 'company and phase required' });
+  const rows = db.prepare(`
+    SELECT u.emp_no, u.name, u.designation, u.grade,
+           m.name as manager,
+           gs.status as goal_status,
+           r.status as review_status,
+           r.self_submitted_at, r.mgr_submitted_at,
+           r.overall_score, r.system_rating, r.final_rating
+    FROM users u
+    LEFT JOIN users m ON u.reports_to = m.emp_no
+    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+    LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ?
+    WHERE u.is_active = 1 AND u.company = ?
+    ORDER BY u.name
+  `).all(CYCLE, phase, company);
+  res.json(rows);
+});
+
 router.get('/reports/grading-data', requireHR, (req, res) => {
   const phases = ['mid_year', 'year_end'];
   const result = {};
@@ -1046,7 +1085,29 @@ router.get('/reports/grading-data', requireHR, (req, res) => {
     rows.forEach(r => { dist[phase].byRating[r.rating] = r.cnt; });
   });
 
-  res.json({ byCompany: result, distribution: dist });
+  // Appraisal submission status per company per phase
+  // status breakdown: self_submitted, mgr_submitted (complete), in_progress, not_started
+  const reviewStatus = {};
+  phases.forEach(phase => {
+    const rows = db.prepare(`
+      SELECT u.company,
+             COUNT(u.emp_no) as headcount,
+             SUM(CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END) as has_review,
+             SUM(CASE WHEN r.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mgr_submitted,
+             SUM(CASE WHEN r.self_submitted_at IS NOT NULL AND r.mgr_submitted_at IS NULL THEN 1 ELSE 0 END) as self_only,
+             SUM(CASE WHEN r.id IS NOT NULL AND r.self_submitted_at IS NULL THEN 1 ELSE 0 END) as in_progress,
+             SUM(CASE WHEN r.id IS NULL AND gs.id IS NOT NULL THEN 1 ELSE 0 END) as not_started_goals,
+             SUM(CASE WHEN gs.id IS NULL THEN 1 ELSE 0 END) as no_goals
+      FROM users u
+      LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+      LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ?
+      WHERE u.is_active = 1
+      GROUP BY u.company ORDER BY u.company
+    `).all(CYCLE, phase);
+    reviewStatus[phase] = rows;
+  });
+
+  res.json({ byCompany: result, distribution: dist, reviewStatus });
 });
 
 module.exports = router;
