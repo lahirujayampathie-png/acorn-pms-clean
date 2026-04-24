@@ -440,6 +440,16 @@ function calcMgrScore(kras,phase){
 function isHR(){return G.user&&G.user.role==='hr_admin';}
 function rl(r){return RL[r]||0;}
 function fmtD(ts){return ts?new Date(ts*1000).toLocaleDateString('en-GB'):'\u2014';}
+function fmtDateRange(s,e){
+  // s,e = 'YYYY-MM-DD' strings → '01 Apr – 30 Apr 2026'
+  var months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var sd=new Date(s),ed=new Date(e);
+  var sm=months[sd.getMonth()],em=months[ed.getMonth()];
+  var sy=sd.getFullYear(),ey=ed.getFullYear();
+  var start=sd.getDate()+' '+sm+(sy!==ey?' '+sy:'');
+  var end=ed.getDate()+' '+em+' '+ey;
+  return start+' \u2013 '+end;
+}
 function cap(s){return s?s.charAt(0).toUpperCase()+s.slice(1):'';}
 function isExtCo(co){return EXT_COS.indexOf(co)>=0;}
 function sel(id){return document.getElementById(id);}
@@ -541,42 +551,47 @@ function pgDash(){
       var direct=G.team.filter(function(e){return e.reports_to===u.emp_no;});
       var pending=direct.filter(function(e){return e.goal_status==='submitted';}).length;
       var approved=direct.filter(function(e){return e.goal_status==='approved';}).length;
-      var sc=gs?calcScore(gs.kras,'mid'):null,rt=sc!=null?getRating(sc):null;
+      // Bug 4: count pending mid-year reviews for supervisor notification
+      var pendingMidYear=direct.filter(function(e){return e.mid_review_status==='self_submitted'||e.goal_status==='approved';}).length;
+      var sc=gs?calcScore(gs.kras,'mid'):null;
+      // Bug 3: use indicative rating for mid-year (sc/50)*100
+      var indPct=sc!=null?Math.round((sc/50)*100*10)/10:null;
+      var rt=indPct!=null?getRating(indPct):null;
 
       var h='<div class="cycle-status-bar">'+
         '<div class="cs-item'+(cyc.goal_setting_open?' active':'')+'">'+
         '<div class="cs-lbl">Goal Setting</div>'+
         '<div class="cs-status">'+(cyc.goal_setting_open?'\u{1F7E2} Open':'\u26aa Closed')+'</div>'+
-        '<div class="cs-date">Deadline: 30 Apr 2026</div></div>'+
+        '<div class="cs-date">'+(cyc.gs_start&&cyc.gs_end?fmtDateRange(cyc.gs_start,cyc.gs_end):'01 Apr \u2013 30 Apr 2026')+'</div></div>'+
         '<div class="cs-item'+(cyc.mid_year_open?' active':'')+'">'+
         '<div class="cs-lbl">Mid-Year Review</div>'+
         '<div class="cs-status">'+(cyc.mid_year_open?'\u{1F7E2} Open':'\u26aa Closed')+'</div>'+
-        '<div class="cs-date">01\u201331 Oct 2025</div></div>'+
+        '<div class="cs-date">'+(cyc.mid_start&&cyc.mid_end?fmtDateRange(cyc.mid_start,cyc.mid_end):'01 Oct \u2013 31 Oct 2026')+'</div></div>'+
         '<div class="cs-item'+(cyc.year_end_open?' active':'')+'">'+
         '<div class="cs-lbl">Year-End Review</div>'+
         '<div class="cs-status">'+(cyc.year_end_open?'\u{1F7E2} Open':'\u26aa Closed')+'</div>'+
-        '<div class="cs-date">15\u201331 Mar 2026</div></div>'+
+        '<div class="cs-date">'+(cyc.ye_start&&cyc.ye_end?fmtDateRange(cyc.ye_start,cyc.ye_end):'15 Mar \u2013 31 Mar 2027')+'</div></div>'+
         '</div>';
 
       h+='<div class="stats s4">'+
         sCard(gs?cap(gs.status):'Not Started','My Goal Sheet',
           gs&&gs.submitted_at?'Submitted '+fmtD(gs.submitted_at):'Action required',null)+
         sCard(sc!=null?sc+'%':'\u2014','Mid-Year Score',
-          rt?'Rating: '+rt.r+' \u2014 '+rt.lbl:'No data yet',rt?rt.col:null)+
-        sCard(direct.length,'Direct Reports',direct.length+' direct · '+G.team.length+' total in tree',null)+
-        sCard(pending,'Pending Approvals',approved+' approved'+(pending>0?' \u26a0':' \u2713'),
+          rt?'Indicative: '+rt.r+' \u2014 '+rt.lbl:'No data yet',rt?rt.col:null)+
+        sCard(direct.length,'Direct Reports',direct.length+' direct \u00b7 '+G.team.length+' total in tree',null)+
+        sCard(pending,'Pending Goal Approvals',approved+' approved'+(pending>0?' \u26a0':' \u2713'),
           pending>0?'#D97706':null)+'</div>';
 
       h+='<div class="two-col">';
-      h+='<div class="card"><div class="card-title">My KRA Progress</div>';
+      h+='<div class="card"><div class="card-title">My KRA Progress <span class="card-sub">Mid-year achievement</span></div>';
       if(gs&&gs.kras&&gs.kras.length){
         gs.kras.forEach(function(k){
-          var ks=0,kw=0;
-          (k.kpis||[]).forEach(function(p){if(p.mid_ach!=null){ks+=p.mid_ach*(p.kpi_weight/100);kw+=p.kpi_weight;}});
-          var s=kw>0?(ks/kw)*100:null,col=s!=null?(s>=85?'#16A34A':s>=60?'#D97706':'#DC2626'):'#D1D5DB';
+          var kraAch=calcKraAch(k,'mid');
+          var col=kraAch!=null?(kraAch>=85?'#16A34A':kraAch>=60?'#D97706':'#DC2626'):'#D1D5DB';
           h+='<div style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;margin-bottom:5px">'+
             '<span style="font-size:12px;font-weight:500">'+esc(k.kra_name)+'</span>'+
-            '<span style="font-size:10px;color:var(--g400)">'+k.kra_weight+'%</span></div>'+pb(s||0,col)+'</div>';
+            '<span style="font-size:10px;color:var(--g400)">Wt: '+k.kra_weight+'% &nbsp;|&nbsp; Ach: <strong>'+(kraAch!=null?kraAch+'%':'—')+'</strong></span></div>'+
+            pb(kraAch||0,col)+'</div>';
         });
       }else{h+='<div class="empty" style="padding:20px 0">No goals set yet</div>';}
       h+='<div style="margin-top:10px" id="dash-goal-btn"></div></div>';
@@ -584,13 +599,43 @@ function pgDash(){
       h+='<div>';
       if(pending>0){
         h+='<div class="card" style="border-left:3px solid var(--amber);margin-bottom:14px">'+
-          '<div class="card-title" style="color:var(--amber)">\u26a0 '+pending+' Approval'+(pending>1?'s':'')+' Waiting</div>';
+          '<div class="card-title" style="color:var(--amber)">\u26a0 '+pending+' Goal Approval'+(pending>1?'s':'')+' Waiting</div>';
         direct.filter(function(e){return e.goal_status==='submitted';}).slice(0,4).forEach(function(e){
           h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--g100)">'+
             '<div class="nc">'+avEl(e,'sm')+'<span style="font-size:12px;font-weight:500">'+esc(e.name)+'</span></div>'+
             '<button class="btn btn-green btn-sm" id="dash-appr-'+e.emp_no+'">Review</button></div>';
         });
         h+='</div>';
+      }
+      // Bug 4 — mid-year submissions pending supervisor review
+      if(cyc.mid_year_open){
+        var midPending=direct.filter(function(e){return e.mid_submitted&&!e.mid_mgr_submitted;});
+        if(midPending.length>0){
+          h+='<div class="card" style="border-left:3px solid var(--blue);margin-bottom:14px">'+
+            '<div class="card-title" style="color:var(--blue)">\ud83d\udcc5 '+midPending.length+' Mid-Year Review'+(midPending.length>1?'s':'')+' Awaiting Your Feedback</div>';
+          midPending.slice(0,4).forEach(function(e){
+            h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--g100)">'+
+              '<div class="nc">'+avEl(e,'sm')+'<span style="font-size:12px;font-weight:500">'+esc(e.name)+'</span></div>'+
+              '<button class="btn btn-sm btn-blue" id="dash-mid-'+e.emp_no+'">Give Feedback \u2192</button></div>';
+          });
+          h+='<div style="text-align:right;margin-top:8px"><button class="btn btn-sm" id="dash-team-reviews-btn">View All Team Reviews \u2192</button></div></div>';
+        }
+      }
+      // Bug 8 — live status summary
+      if(direct.length>0&&(cyc.mid_year_open||cyc.year_end_open)){
+        var phase=cyc.year_end_open?'Year-End':'Mid-Year';
+        var submitted=direct.filter(function(e){return cyc.year_end_open?e.ye_submitted:e.mid_submitted;}).length;
+        var notStarted=direct.length-submitted;
+        h+='<div class="card" style="margin-bottom:14px">'+
+          '<div class="card-title">\ud83d\udcca '+phase+' Status <span class="card-sub">'+direct.length+' direct reports</span></div>'+
+          '<div style="display:flex;gap:12px;flex-wrap:wrap">'+
+          '<div style="flex:1;min-width:80px;text-align:center;background:var(--g50);border-radius:var(--r);padding:10px">'+
+          '<div style="font-size:22px;font-weight:700;color:var(--green)">'+submitted+'</div>'+
+          '<div style="font-size:10px;color:var(--g500)">Submitted</div></div>'+
+          '<div style="flex:1;min-width:80px;text-align:center;background:var(--g50);border-radius:var(--r);padding:10px">'+
+          '<div style="font-size:22px;font-weight:700;color:var(--amber)">'+notStarted+'</div>'+
+          '<div style="font-size:10px;color:var(--g500)">Pending</div></div>'+
+          '</div></div>';
       }
       if(direct.length){
         h+='<div class="card"><div class="card-title">Direct Reports <span class="card-sub">'+direct.length+'</span></div>';
@@ -635,6 +680,13 @@ function pgDash(){
       direct.filter(function(e){return e.goal_status==='submitted';}).slice(0,4).forEach(function(e){
         var b=sel('dash-appr-'+e.emp_no);if(b)b.onclick=function(){go('approvals');};
       });
+      // Bug 4 — wire mid-year pending buttons
+      direct.filter(function(e){return e.mid_submitted&&!e.mid_mgr_submitted;}).slice(0,4).forEach(function(e){
+        var b=sel('dash-mid-'+e.emp_no);
+        if(b)b.onclick=(function(en){return function(){openSupervisorReviewModal(en,'mid');};})(e.emp_no);
+      });
+      var trb=sel('dash-team-reviews-btn');if(trb)trb.onclick=function(){go('teamReviews');};
+      var tb=sel('dash-team-btn');if(tb)tb.onclick=function(){go('teamGoals');};
     });
   });
 }
@@ -672,8 +724,8 @@ function pgGoals(){
       var canEdit=(!gs||gs.status==='draft'||gs.status==='rejected');
 
       // Only load from server if editKRAs is null (fresh load or after save)
-      // Never overwrite editKRAs if user is actively editing — they may have added/changed KPIs
-      if(!editKRAs){
+      // IMPORTANT: If status is 'approved', always use server data — supervisor may have amended weightages
+      if(!editKRAs || (gs&&gs.status==='approved')){
         if(gs&&gs.kras&&gs.kras.length){
           editKRAs=JSON.parse(JSON.stringify(gs.kras));
         } else if(!gs){
@@ -836,7 +888,7 @@ function renderGoalPage(src,gs,canEdit){
       if(canEdit)h+='<input class="kpi-inp" type="number" id="kpi-wt-'+ki+'-'+pi+'" min="0" max="100" value="'+kpi.kpi_weight+'" oninput="liveKPICheck('+ki+')">';
       else h+=kpi.kpi_weight+'%';
       h+='</div>';
-      h+='<div class="kpi-c"><input class="kpi-inp active" type="number" id="kpi-mid-'+ki+'-'+pi+'" min="0" max="200" step="0.1" value="'+(kpi.mid_ach!=null?kpi.mid_ach:'')+'" placeholder="Enter%"'+(midEnabled?'':' disabled')+' oninput="liveKPIAchCheck(this,'+ki+','+pi+')"></div>';
+      h+='<div class="kpi-c"><input class="kpi-inp active" type="number" id="kpi-mid-'+ki+'-'+pi+'" min="0" max="200" step="any" value="'+(kpi.mid_ach!=null?kpi.mid_ach:'')+'" placeholder="Enter%"'+(midEnabled?'':' disabled')+' oninput="liveKPIAchCheck(this,'+ki+','+pi+')"></div>';
       h+='<div class="kpi-c">'+(aRt?rBdg(aRt.r):'<span style="color:var(--g400);">\u2014</span>')+'</div>';
       h+='</div>';
     });
@@ -880,7 +932,10 @@ function renderGoalPage(src,gs,canEdit){
   // Wire KRA controls
   kras.forEach(function(kra,ki){
     var hd=sel('kra-hd-'+ki);
-    if(hd)hd.onclick=function(e){
+    // In edit mode, don't wire collapse — clicking the header while editing
+    // collapses the KPI body, making it look like KPIs have disappeared.
+    // Collapse is only useful in read-only (locked/submitted) view mode.
+    if(hd&&!canEdit)hd.onclick=function(e){
       if(e.target.tagName==='INPUT'||e.target.tagName==='BUTTON'||e.target.tagName==='SELECT')return;
       toggleKRA(ki);
     };
@@ -1361,7 +1416,7 @@ function buildMonthlyEntryGrid(gs,mpMap,selMonth,readOnly,reviews){
 
         '<div style="text-align:center">'+
         (locked?'<div style="font-weight:700;color:var(--g700);font-size:13px">'+(inc!==''?inc+'%':'—')+'</div>':
-        '<input class="kpi-inp active" type="number" min="0" max="200" step="0.1" id="mt-kpi-'+kpi.id+
+        '<input class="kpi-inp active" type="number" min="0" max="200" step="any" id="mt-kpi-'+kpi.id+
         '" value="'+inc+'" placeholder="0%" oninput="mtUpdateInd('+kpi.id+','+selMonth+','+prior+')">')+
         '<div style="font-size:9px;color:var(--g400);margin-top:2px">This month</div></div>'+
 
@@ -1525,7 +1580,7 @@ function buildMidBody(gs,sc,rt){
         '<div class="kpi-c">'+
         (submitted?
           '<span style="font-weight:600;color:var(--g700)">'+(kpi.mid_ach!=null?kpi.mid_ach+'%':'\u2014')+'</span>':
-          '<input class="kpi-inp active" type="number" min="0" max="200" step="0.1" id="rv-kpi-'+kpi.id+'" value="'+(kpi.mid_ach!=null?kpi.mid_ach:'')+'" placeholder="Enter%">')+
+          '<input class="kpi-inp active" type="number" min="0" max="200" step="any" id="rv-kpi-'+kpi.id+'" value="'+(kpi.mid_ach!=null?kpi.mid_ach:'')+'" placeholder="Enter%">')+
         '</div>'+
         '<div class="kpi-c" title="Indicative: tracks against 50% mid-year target">'+
         (indRt?rBdg(indRt.r)+'<span style="font-size:9px;color:var(--g400);display:block;text-align:center">indicative</span>':
@@ -1653,7 +1708,12 @@ function saveAchs(gs,phase){
 function buildYearEndBody(gs){
   var isExt=isExtCo(G.user.company||'');
   var grid=isExt?'grid-template-columns:1fr 72px 72px 66px 82px 82px 82px':'grid-template-columns:1fr 66px 82px 82px 82px';
-  var h='<div class="alert al-info">\ud83d\udccb Year-end review: <strong>15\u201331 Mar 2027</strong>. Enter your final achievement % for each KPI.</div>';
+  var h='<div class="card" style="background:var(--purple-l,#F5F3FF);border-color:var(--purple,#7C3AED);margin-bottom:2px">'+
+    '<div style="display:flex;align-items:center;gap:12px">'+
+    '<div style="width:40px;height:40px;border-radius:10px;background:var(--purple,#7C3AED);color:#fff;font-size:18px;display:flex;align-items:center;justify-content:center">\ud83c\udfc6</div>'+
+    '<div><div style="font-size:16px;font-weight:700;color:var(--g900)">Year-End Performance Appraisal</div>'+
+    '<div style="font-size:11px;color:var(--g500);margin-top:2px">FY 2026\u201327 &nbsp;\u00b7&nbsp; 15\u201331 March 2027 &nbsp;\u00b7&nbsp; Enter your final KPI achievements and self-assessment below</div>'+
+    '</div></div></div>';
 
   // Show supervisor feedback only after HR publishes calibration
   var yeRev=gs&&gs.reviews?gs.reviews.find(function(r){return r.review_type==='year_end';}):null;
@@ -1693,7 +1753,7 @@ function buildYearEndBody(gs){
         (isExt?'<div class="kpi-c">'+esc(kpi.track_freq)+'</div><div class="kpi-c">'+esc(kpi.assess_freq)+'</div>':'')+
         '<div class="kpi-c">'+kpi.kpi_weight+'%</div>'+
         '<div class="kpi-c">'+(kpi.mid_ach!=null?'<span style="font-weight:600;color:var(--g500)">'+kpi.mid_ach+'%</span>':'<span style="color:var(--g400)">\u2014</span>')+'</div>'+
-        '<div class="kpi-c"><input class="kpi-inp active" type="number" min="0" max="200" step="0.1" id="ye-kpi-'+kpi.id+'" value="'+(empAch!=null?empAch:'')+'" placeholder="Enter%" oninput="yeUpdateRating(this,\'ye-rt-'+kpi.id+'\')"></div>'+
+        '<div class="kpi-c"><input class="kpi-inp active" type="number" min="0" max="200" step="any" id="ye-kpi-'+kpi.id+'" value="'+(empAch!=null?empAch:'')+'" placeholder="Enter%" oninput="yeUpdateRating(this,\'ye-rt-'+kpi.id+'\')"></div>'+
         '<div class="kpi-c" id="ye-rt-'+kpi.id+'">'+(empRt?rBdg(empRt.r):'<span style="color:var(--g400)">\u2014</span>')+'</div>'+
         '</div>';
     });
@@ -2189,7 +2249,7 @@ function filterHRR(){
 function buildHRRTable(list){
   if(!list.length)return'<div class="empty">No employees found</div>';
   var h='<div class="tbl-wrap"><table class="tbl"><thead><tr>'+
-    '<th>Employee</th><th>Company</th><th>Goal Status</th><th>Goal Sheet</th><th>Monthly</th><th>Mid-Year</th><th>Year-End</th>'+
+    '<th>Employee</th><th>Company</th><th>Goal Status</th><th>Goal Sheet</th><th>Monthly</th><th>Mid-Year</th><th>Reset Mid</th><th>Year-End</th><th>Reset YE</th>'+
     '</tr></thead><tbody>';
   list.slice(0,150).forEach(function(u,i){
     h+='<tr>'+
@@ -2200,7 +2260,9 @@ function buildHRRTable(list){
       '<td><button class="btn btn-sm" id="hrr-gs-'+i+'" title="View/edit goal sheet">Goals \u2192</button></td>'+
       '<td><button class="btn btn-sm" id="hrr-mp-'+i+'" title="View monthly progress">\ud83d\udcc8 Monthly</button></td>'+
       '<td><button class="btn btn-sm" id="hrr-mid-'+i+'" title="Open mid-year review">Mid-Year \u2192</button></td>'+
+      '<td><button class="btn btn-sm btn-amber" id="hrr-rmid-'+i+'" title="Reset mid-year review">\u21ba Reset Mid</button></td>'+
       '<td><button class="btn btn-sm" id="hrr-ye-'+i+'" title="Open year-end review">Year-End \u2192</button></td>'+
+      '<td><button class="btn btn-sm btn-amber" id="hrr-rye-'+i+'" title="Reset year-end review">\u21ba Reset YE</button></td>'+
       '</tr>';
   });
   return h+'</tbody></table></div>'+(list.length>150?'<div class="empty" style="padding:8px">Showing 150 of '+list.length+' \u2014 filter to see more</div>':'');
@@ -2213,8 +2275,26 @@ function wireHRRTable(list){
     if(mpb)mpb.onclick=(function(en,nm){return function(){openMonthlyProgressModal(en,nm);};})(u.emp_no,u.name);
     var mb=sel('hrr-mid-'+i);
     if(mb)mb.onclick=(function(en){return function(){openSupervisorReviewModal(en,'mid');};})(u.emp_no);
+    var rmid=sel('hrr-rmid-'+i);
+    if(rmid)rmid.onclick=(function(en,nm){return function(){
+      if(!confirm('Reset mid-year review for '+nm+'?\n\nThis will delete their mid-year submission and clear all mid-year KPI achievements. This cannot be undone.'))return;
+      xhr('POST','/api/reviews/'+en+'/reset',{review_type:'mid_year'},function(err,res){
+        if(err){toast(err,'error');return;}
+        toast('\u2713 Mid-year review reset for '+nm,'ok');
+        pgHRReviews();
+      });
+    };})(u.emp_no,u.name);
     var yb=sel('hrr-ye-'+i);
     if(yb)yb.onclick=(function(en){return function(){openSupervisorReviewModal(en,'end');};})(u.emp_no);
+    var rye=sel('hrr-rye-'+i);
+    if(rye)rye.onclick=(function(en,nm){return function(){
+      if(!confirm('Reset year-end review for '+nm+'?\n\nThis will delete their year-end submission and clear all year-end KPI achievements. This cannot be undone.'))return;
+      xhr('POST','/api/reviews/'+en+'/reset',{review_type:'year_end'},function(err,res){
+        if(err){toast(err,'error');return;}
+        toast('\u2713 Year-end review reset for '+nm,'ok');
+        pgHRReviews();
+      });
+    };})(u.emp_no,u.name);
   });
 }
 function openHRGoalModal(empNo){
@@ -2277,9 +2357,10 @@ function pgHRDash(){
       if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
       var gs={}; (s.goal_stats||[]).forEach(function(g){gs[g.status]=g.n;});
       var c=G.cycle;
-      var h='<div class="alert al-info"><strong>HR Admin</strong> \u2014 Full visibility across all 11 companies, 284 employees.</div>'+
+      var coCount=(s.by_company||[]).length;
+      var h='<div class="alert al-info"><strong>HR Admin</strong> \u2014 Full visibility across all '+coCount+' companies, '+(s.total_users||0)+' employees.</div>'+
         '<div class="stats s5" style="margin-bottom:16px">'+
-        sCard(s.total_users,'Total Employees','11 companies',null)+
+        sCard(s.total_users,'Total Employees',coCount+' companies',null)+
         sCard(s.activated||0,'Activated',(s.not_activated||0)+' pending',null)+
         sCard(gs.approved||0,'Goals Approved',(gs.submitted||0)+' pending',null)+
         sCard(s.locked||0,'Locked Accounts',s.locked>0?'Action needed':'All clear',s.locked>0?'#DC2626':null)+
@@ -2298,14 +2379,36 @@ function pgHRDash(){
         buildPhaseCard("ye","Year-End Review",c.year_end_open,c.ye_start||"2027-03-15",c.ye_end||"2027-03-31",c.ye_note||"")+'</div>'+
         '</div></div>';
 
-      // Company activation
-      h+='<div class="card"><div class="card-title">Activation by Company</div>';
+      // Company activation — always show activated/total counts and % regardless of whether
+      // anyone has activated yet. Uses activated_n from the fixed admin.js stats route.
+      var totalAct=0,totalHC=0;
+      (s.by_company||[]).forEach(function(co){totalAct+=(co.activated_n||0);totalHC+=co.n;});
+      var totalPct=totalHC>0?Math.round(totalAct/totalHC*100):0;
+      h+='<div class="card">'+
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'+
+        '<div class="card-title" style="margin:0">Activation by Company</div>'+
+        '<span style="font-size:11px;color:var(--g500);font-weight:500">'+totalAct+' / '+totalHC+' activated &nbsp;<strong style="color:'+(totalPct>=80?'var(--green)':totalPct>=50?'var(--amber)':'var(--red)')+'">'+totalPct+'%</strong></span>'+
+        '</div>';
       (s.by_company||[]).forEach(function(co){
-        var pct=co.n>0?Math.round((co.activated_n||0)/co.n*100):0;
-        h+='<div style="margin-bottom:11px"><div style="display:flex;justify-content:space-between;margin-bottom:4px">'+
-          '<span style="font-size:11px;font-weight:500">'+esc((co.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited',''))+'</span>'+
-          '<span style="font-size:10px;color:var(--g400)">'+co.n+' staff</span></div>'+
-          pb(pct,pct>=80?'#16A34A':pct>=50?'#D97706':'#DC2626')+'</div>';
+        var act=co.activated_n||0;
+        var tot=co.n||0;
+        // Use exact decimal then round — prevents floating point display errors
+        var pct=tot>0?Math.round(act/tot*100):0;
+        var coShort=esc((co.company||'').replace(' (Private) Limited','').replace(' (Pvt) Ltd','').replace(' (Private) Ltd',''));
+        var barCol=pct>=80?'#16A34A':pct>=50?'#D97706':'#DC2626';
+        // If nobody activated yet show grey bar at full width so the row is still visible
+        var barPct=tot>0?(act>0?pct:0):0;
+        h+='<div style="margin-bottom:13px">'+
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'+
+          '<span style="font-size:11px;font-weight:500">'+coShort+'</span>'+
+          '<div style="display:flex;gap:10px;align-items:center">'+
+          '<span style="font-size:11px;color:var(--g600);font-weight:500">'+act+' / '+tot+'</span>'+
+          '<span style="font-size:11px;font-weight:600;min-width:36px;text-align:right;color:'+(act>0?barCol:'var(--g400)')+'">'+pct+'%</span>'+
+          '</div></div>'+
+          // Background track + filled bar
+          '<div style="height:7px;background:var(--g100);border-radius:4px;overflow:hidden">'+
+          '<div style="height:100%;width:'+barPct+'%;background:'+barCol+';border-radius:4px;transition:width .4s ease"></div>'+
+          '</div></div>';
       });
       h+='</div></div>';
 
@@ -2505,96 +2608,232 @@ function wireCalibTable(list){
 }
 
 // ── REPORTS ───────────────────────────────────────────────────
+// ── REPORTS ──────────────────────────────────────────────────
+// Report definitions: name, CSV slug (matches /api/export/<slug>), icon, description
+var REPORT_DEFS=[
+  {slug:'full-pms-status',          name:'Full PMS Status',            icon:'\ud83d\udcca', desc:'Every employee with goal status, mid-year & year-end scores and ratings'},
+  {slug:'goal-completion-report',   name:'Goal Completion by Company', icon:'\ud83c\udfaf', desc:'Submission and approval rates broken down by company'},
+  {slug:'rating-distribution',      name:'Rating Distribution',        icon:'\ud83d\udcc8', desc:'A\u2013E breakdown for mid-year and year-end across the organisation'},
+  {slug:'mid-year-appraisal-summary',name:'Mid-Year Appraisal Summary',icon:'\ud83d\uddd2', desc:'All mid-year scores, self-evaluation comments and manager assessments'},
+  {slug:'year-end-appraisal-summary',name:'Year-End Appraisal Summary',icon:'\ud83d\udcdd', desc:'All year-end scores, comments, competency ratings and promotion flags'},
+  {slug:'calibration-sheet',        name:'Calibration Sheet',          icon:'\u2605',       desc:'System ratings, override ratings and final calibrated ratings for all employees'},
+  {slug:'company-grading',          name:'Company Grading Export',     icon:'\ud83c\udfc6', desc:'Per-company A\u2013E counts for both mid-year and year-end phases'},
+  {slug:'employee-directory',       name:'Employee Directory',         icon:'\ud83d\udc65', desc:'Full org chart with reporting lines, grades and system roles'},
+];
+
 function pgReports(){
+  setContent('<div class="empty">Loading reports\u2026</div>');
   xhr('GET','/admin/stats',null,function(err,s){
     if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
-    xhr('GET','/api/calibration',null,function(e2,cal){
-      var dist={A:0,B:0,C:0,D:0,E:0},withSc=0;
-      (cal||[]).forEach(function(e){if(e.system_rating){dist[e.system_rating]++;withSc++;}});
+    xhr('GET','/api/reports/grading-data',null,function(e2,gd){
       var gs={}; (s.goal_stats||[]).forEach(function(g){gs[g.status]=g.n;});
+
+      // ── Summary KPI cards ──────────────────────────────────
+      var midTotal=(gd&&gd.distribution&&gd.distribution.mid_year)?gd.distribution.mid_year.total:0;
+      var yeTotal =(gd&&gd.distribution&&gd.distribution.year_end) ?gd.distribution.year_end.total:0;
+      var approvalPct=Math.round(((gs.approved||0)/Math.max(s.total_users||1,1))*100);
       var h='<div class="stats s4" style="margin-bottom:16px">'+
-        sCard(s.total_users,'Total Headcount','11 companies',null)+
-        sCard(Math.round(((gs.approved||0)/Math.max(s.total_users,1))*100)+'%','Goal Approval Rate',(gs.approved||0)+' approved',null)+
-        sCard(withSc,'Mid-Year Submitted','',null)+
-        sCard(s.total_users-(s.activated||0),'Accounts Pending','Not yet activated',null)+'</div>';
-      h+='<div class="two-col">';
-      h+='<div class="card"><div class="card-title">Rating Distribution (Mid-Year)</div>';
-      if(!withSc){h+='<div class="empty" style="padding:20px 0">No scores submitted yet</div>';}
-      else{
-        RATINGS.forEach(function(r){
-          var cnt=dist[r.r]||0,pct=withSc?Math.round(cnt/withSc*100):0;
-          h+='<div style="margin-bottom:12px">'+
-            '<div style="display:flex;justify-content:space-between;margin-bottom:5px">'+
-            '<span style="font-size:11px;font-weight:600;color:'+r.col+'">'+r.r+' \u2014 '+r.lbl+'</span>'+
-            '<span style="font-size:11px;color:var(--g400)">'+cnt+' employees ('+pct+'%)</span></div>'+
-            pb(pct,r.col)+'</div>';
-        });
-      }
-      h+='</div>';
-      h+='<div class="card"><div class="card-title">Goal Status by Company</div>'+
+        sCard(s.total_users||0,'Total Headcount','Across all companies',null)+
+        sCard(approvalPct+'%','Goal Approval Rate',(gs.approved||0)+' of '+(s.total_users||0)+' approved',null)+
+        sCard(midTotal,'Mid-Year Reviews','Scores submitted',null)+
+        sCard(yeTotal,'Year-End Reviews','Scores submitted',null)+
+        '</div>';
+
+      // ── Rating Distribution — tabbed Mid / Year-End ────────
+      h+='<div class="card" style="margin-bottom:14px">'+
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'+
+        '<div class="card-title" style="margin:0">Rating Distribution</div>'+
+        '<div style="display:flex;gap:4px">'+
+        '<button class="btn btn-sm btn-blue" id="rpt-tab-mid" onclick="rptTab(\'mid\')">Mid-Year</button>'+
+        '<button class="btn btn-sm" id="rpt-tab-ye" onclick="rptTab(\'ye\')">Year-End</button>'+
+        '</div></div>'+
+        '<div id="rpt-dist-mid">'+buildDistBars(gd,'mid_year')+'</div>'+
+        '<div id="rpt-dist-ye" style="display:none">'+buildDistBars(gd,'year_end')+'</div>'+
+        '</div>';
+
+      // ── Company Grading Table ──────────────────────────────
+      h+='<div class="card" style="margin-bottom:14px">'+
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">'+
+        '<div class="card-title" style="margin:0">Company Grading</div>'+
+        '<div style="display:flex;gap:4px">'+
+        '<button class="btn btn-sm btn-blue" id="cg-tab-mid" onclick="cgTab(\'mid\')">Mid-Year</button>'+
+        '<button class="btn btn-sm" id="cg-tab-ye" onclick="cgTab(\'ye\')">Year-End</button>'+
+        '</div></div>'+
+        '<div id="cg-mid">'+buildGradingTable(gd,'mid_year',s)+'</div>'+
+        '<div id="cg-ye" style="display:none">'+buildGradingTable(gd,'year_end',s)+'</div>'+
+        '</div>';
+
+      // ── Goal Status by Company ─────────────────────────────
+      h+='<div class="card" style="margin-bottom:14px">'+
+        '<div class="card-title">Goal Status by Company</div>'+
         '<div class="tbl-wrap"><table class="tbl"><thead><tr>'+
-        '<th>Company</th><th>Staff</th><th>Approved</th><th>Pending</th><th>Not Started</th>'+
+        '<th>Company</th><th>Staff</th><th style="color:var(--green)">Approved</th>'+
+        '<th style="color:var(--amber)">Pending</th><th style="color:var(--g400)">Draft</th>'+
+        '<th style="color:var(--red)">Not Started</th><th>Approval %</th>'+
         '</tr></thead><tbody>';
       (s.by_company||[]).forEach(function(co){
-        var notStarted=co.n-(co.approved_n||0)-(co.submitted_n||0);
-        h+='<tr><td style="font-size:11px;font-weight:500">'+esc((co.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited',''))+'</td>'+
+        var notStarted=co.n-(co.approved_n||0)-(co.submitted_n||0)-(co.draft_n||0);
+        var pct=co.n>0?Math.round((co.approved_n||0)/co.n*100):0;
+        var coName=esc((co.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited','').replace(' (Private) Ltd',''));
+        h+='<tr>'+
+          '<td style="font-size:11px;font-weight:500">'+coName+'</td>'+
           '<td>'+co.n+'</td>'+
           '<td><span style="color:var(--green);font-weight:500">'+(co.approved_n||0)+'</span></td>'+
           '<td><span style="color:var(--amber);font-weight:500">'+(co.submitted_n||0)+'</span></td>'+
-          '<td><span style="color:var(--red);font-weight:500">'+notStarted+'</span></td></tr>';
+          '<td><span style="color:var(--g400);font-weight:500">'+(co.draft_n||0)+'</span></td>'+
+          '<td><span style="color:var(--red);font-weight:500">'+Math.max(0,notStarted)+'</span></td>'+
+          '<td>'+pb(pct,pct>=80?'#16A34A':pct>=50?'#D97706':'#DC2626')+'</td>'+
+          '</tr>';
       });
-      h+='</tbody></table></div></div></div>';
+      h+='</tbody></table></div></div>';
 
-      // Download section
-      h+='<div class="card" style="margin-top:14px">'+
-        '<div class="card-title">Download Reports <span class="card-sub">Excel & PDF exports</span></div>'+
-        '<div class="alert al-info" style="margin-bottom:16px">\u2139 Select a report type below. Reports include current data as of today.</div>'+
-        '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px" id="rpt-grid"></div></div>';
+      // ── Download Reports ───────────────────────────────────
+      h+='<div class="card">'+
+        '<div class="card-title">Download Reports <span class="card-sub">CSV exports \u2014 open directly in Excel</span></div>'+
+        '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px" id="rpt-grid"></div>'+
+        '</div>';
+
       setContent(h);
-
-      var rptGrid=sel('rpt-grid');
-      if(rptGrid){
-        var reports=[
-          {name:'Full PMS Status',desc:'All employees with goal & review status',icon:'\ud83d\udcca'},
-          {name:'Goal Completion Report',desc:'Goal submission and approval rates by company',icon:'\ud83c\udfaf'},
-          {name:'Rating Distribution',desc:'A\u2013E rating breakdown across organisation',icon:'\ud83d\udcc8'},
-          {name:'Mid-Year Appraisal Summary',desc:'All mid-year scores and comments',icon:'\ud83d\uddd2'},
-          {name:'Calibration Sheet',desc:'Final calibrated ratings for all employees',icon:'\u2605'},
-          {name:'Employee Directory',desc:'Full org chart with reporting lines',icon:'\ud83d\udc65'},
-        ];
-        reports.forEach(function(rpt){
-          var card=document.createElement('div');
-          card.style.cssText='border:1px solid var(--g200);border-radius:var(--r-lg);padding:14px 16px;background:#fff;cursor:pointer;transition:all .15s';
-          card.innerHTML='<div style="font-size:20px;margin-bottom:8px">'+rpt.icon+'</div>'+
-            '<div style="font-size:12px;font-weight:600;margin-bottom:4px">'+esc(rpt.name)+'</div>'+
-            '<div style="font-size:11px;color:var(--g500);margin-bottom:12px">'+esc(rpt.desc)+'</div>'+
-            '<div style="display:flex;gap:6px">'+
-            '<button class="btn btn-sm btn-blue" style="flex:1">\ud83d\udcc5 Excel</button>'+
-            '<button class="btn btn-sm" style="flex:1">\ud83d\udcc4 PDF</button>'+
-            '</div>';
-          card.onmouseenter=function(){this.style.boxShadow='var(--sh-md)';};
-          card.onmouseleave=function(){this.style.boxShadow='';};
-          // Wire download buttons
-          var btns=card.querySelectorAll('button');
-          btns[0].onclick=(function(n){return function(){exportReport(n,'excel');};})(rpt.name);
-          btns[1].onclick=(function(n){return function(){exportReport(n,'pdf');};})(rpt.name);
-          rptGrid.appendChild(card);
-        });
-      }
+      buildReportGrid();
     });
   });
 }
-function exportReport(name,format){
-  toast('Preparing '+format.toUpperCase()+': '+name+'\u2026','info');
-  var slug=name.toLowerCase().replace(/[^a-z0-9]+/g,'-');
-  var url='/api/export/'+slug+'?format='+format;
-  setTimeout(function(){
-    // Open in new tab - server will serve file when implemented
-    var a=document.createElement('a');
-    a.href=url; a.target='_blank'; a.download=name+'.'+format;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    toast(format.toUpperCase()+' download started \u2713','ok');
-  },600);
+
+function buildDistBars(gd,phase){
+  var d=(gd&&gd.distribution&&gd.distribution[phase])||{total:0,byRating:{}};
+  if(!d.total)return '<div class="empty" style="padding:16px 0">No scores submitted yet</div>';
+  var h='';
+  RATINGS.forEach(function(r){
+    var cnt=d.byRating[r.r]||0,pct=d.total?Math.round(cnt/d.total*100):0;
+    h+='<div style="margin-bottom:12px">'+
+      '<div style="display:flex;justify-content:space-between;margin-bottom:4px">'+
+      '<span style="font-size:11px;font-weight:600;color:'+r.col+'">'+r.r+' \u2014 '+r.lbl+'</span>'+
+      '<span style="font-size:11px;color:var(--g400)">'+cnt+' ('+pct+'%)</span></div>'+
+      pb(pct,r.col)+'</div>';
+  });
+  h+='<div style="font-size:10px;color:var(--g400);margin-top:6px">Total: '+d.total+' employees with scores</div>';
+  return h;
+}
+
+function buildGradingTable(gd,phase,s){
+  var rows=(gd&&gd.byCompany&&gd.byCompany[phase])||[];
+  if(!rows.length){
+    return '<div class="empty" style="padding:16px 0">No '+
+      (phase==='mid_year'?'mid-year':'year-end')+' scores submitted yet</div>';
+  }
+  // Build a lookup of total headcount from s.by_company
+  var hcMap={};
+  (s.by_company||[]).forEach(function(c){hcMap[c.company]=c.n;});
+
+  var h='<div class="tbl-wrap"><table class="tbl"><thead><tr>'+
+    '<th>Company</th><th>Headcount</th><th>Reviewed</th>'+
+    '<th style="color:#14532d">A</th>'+
+    '<th style="color:#1e3a8a">B</th>'+
+    '<th style="color:#4c1d95">C</th>'+
+    '<th style="color:#78350f">D</th>'+
+    '<th style="color:#7f1d1d">E</th>'+
+    '<th>% A+B</th><th>Coverage</th>'+
+    '</tr></thead><tbody>';
+  rows.forEach(function(co){
+    var coName=esc((co.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited','').replace(' (Private) Ltd',''));
+    var total=co.total||0;
+    var hc=hcMap[co.company]||0;
+    var abPct=total>0?Math.round(((co.rA||0)+(co.rB||0))/total*100):0;
+    var covPct=hc>0?Math.round(total/hc*100):0;
+    // Colour the A+B % — green ≥50%, amber ≥25%, red otherwise
+    var abCol=abPct>=50?'var(--green)':abPct>=25?'var(--amber)':'var(--red)';
+    var covCol=covPct>=80?'var(--green)':covPct>=40?'var(--amber)':'var(--red)';
+    h+='<tr>'+
+      '<td style="font-size:11px;font-weight:500">'+coName+'</td>'+
+      '<td>'+hc+'</td>'+
+      '<td>'+total+'</td>'+
+      '<td><span style="color:#14532d;font-weight:600">'+(co.rA||0)+'</span></td>'+
+      '<td><span style="color:#1e3a8a;font-weight:600">'+(co.rB||0)+'</span></td>'+
+      '<td><span style="color:#4c1d95;font-weight:600">'+(co.rC||0)+'</span></td>'+
+      '<td><span style="color:#78350f;font-weight:600">'+(co.rD||0)+'</span></td>'+
+      '<td><span style="color:#7f1d1d;font-weight:600">'+(co.rE||0)+'</span></td>'+
+      '<td><strong style="color:'+abCol+'">'+abPct+'%</strong></td>'+
+      '<td><span style="color:'+covCol+'">'+covPct+'%</span></td>'+
+      '</tr>';
+  });
+  // Totals row
+  var totRev=rows.reduce(function(s,r){return s+(r.total||0);},0);
+  var totA=rows.reduce(function(s,r){return s+(r.rA||0);},0);
+  var totB=rows.reduce(function(s,r){return s+(r.rB||0);},0);
+  var totC=rows.reduce(function(s,r){return s+(r.rC||0);},0);
+  var totD=rows.reduce(function(s,r){return s+(r.rD||0);},0);
+  var totE=rows.reduce(function(s,r){return s+(r.rE||0);},0);
+  var totHC=rows.reduce(function(s,r){return s+(hcMap[r.company]||0);},0);
+  var totAB=totRev>0?Math.round((totA+totB)/totRev*100):0;
+  var totCov=totHC>0?Math.round(totRev/totHC*100):0;
+  h+='<tr style="background:var(--g50);font-weight:600;border-top:2px solid var(--g300)">'+
+    '<td>All Companies</td><td>'+totHC+'</td><td>'+totRev+'</td>'+
+    '<td style="color:#14532d">'+totA+'</td>'+
+    '<td style="color:#1e3a8a">'+totB+'</td>'+
+    '<td style="color:#4c1d95">'+totC+'</td>'+
+    '<td style="color:#78350f">'+totD+'</td>'+
+    '<td style="color:#7f1d1d">'+totE+'</td>'+
+    '<td style="color:'+(totAB>=50?'var(--green)':'var(--amber)')+'">'+totAB+'%</td>'+
+    '<td style="color:'+(totCov>=80?'var(--green)':'var(--amber)')+'">'+totCov+'%</td>'+
+    '</tr>';
+  h+='</tbody></table></div>';
+  return h;
+}
+
+function buildReportGrid(){
+  var grid=sel('rpt-grid');
+  if(!grid)return;
+  REPORT_DEFS.forEach(function(rpt){
+    var card=document.createElement('div');
+    card.style.cssText='border:1px solid var(--g200);border-radius:var(--r-lg);padding:14px 16px;background:var(--color-background-primary,#fff);transition:all .15s';
+    card.innerHTML='<div style="font-size:20px;margin-bottom:8px">'+rpt.icon+'</div>'+
+      '<div style="font-size:12px;font-weight:600;margin-bottom:4px">'+esc(rpt.name)+'</div>'+
+      '<div style="font-size:11px;color:var(--g500);margin-bottom:12px;line-height:1.4">'+esc(rpt.desc)+'</div>'+
+      '<button class="btn btn-sm btn-blue" style="width:100%" data-slug="'+rpt.slug+'">'+
+      '\u2b07 Download CSV</button>';
+    card.onmouseenter=function(){this.style.boxShadow='var(--sh-md)';};
+    card.onmouseleave=function(){this.style.boxShadow='';};
+    card.querySelector('button').onclick=function(){
+      exportReport(this.getAttribute('data-slug'),rpt.name);
+    };
+    grid.appendChild(card);
+  });
+}
+
+function rptTab(which){
+  var midD=sel('rpt-dist-mid'),yeD=sel('rpt-dist-ye');
+  var midB=sel('rpt-tab-mid'),yeB=sel('rpt-tab-ye');
+  if(!midD)return;
+  if(which==='mid'){
+    midD.style.display='';yeD.style.display='none';
+    midB.className='btn btn-sm btn-blue';yeB.className='btn btn-sm';
+  } else {
+    midD.style.display='none';yeD.style.display='';
+    midB.className='btn btn-sm';yeB.className='btn btn-sm btn-blue';
+  }
+}
+
+function cgTab(which){
+  var midD=sel('cg-mid'),yeD=sel('cg-ye');
+  var midB=sel('cg-tab-mid'),yeB=sel('cg-tab-ye');
+  if(!midD)return;
+  if(which==='mid'){
+    midD.style.display='';yeD.style.display='none';
+    midB.className='btn btn-sm btn-blue';yeB.className='btn btn-sm';
+  } else {
+    midD.style.display='none';yeD.style.display='';
+    midB.className='btn btn-sm';yeB.className='btn btn-sm btn-blue';
+  }
+}
+
+function exportReport(slug,name){
+  var url='/api/export/'+slug;
+  var fname=(name||slug).replace(/[^a-zA-Z0-9 \-]/g,'')+'.csv';
+  toast('Preparing: '+name+'\u2026','info');
+  var a=document.createElement('a');
+  a.href=url; a.download=fname;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function(){toast('Download started \u2713','ok');},400);
 }
 
 // ── EMPLOYEES ───────────────────────────────────────────────────
@@ -2830,7 +3069,7 @@ function openSupervisorReviewModal(empNo,phase){
                 '<div class="kpi-c">'+kpi.kpi_weight+'%</div>'+
                 '<div class="kpi-c" style="font-weight:600;color:'+(empAch!=null?(empAch>=85?'var(--green)':empAch>=60?'var(--amber)':'var(--red)'):'var(--g400)')+'">'+
                 (empAch!=null?empAch+'%':'\u2014')+'</div>'+
-                '<div class="kpi-c"><input class="kpi-inp mgr" type="number" min="0" max="200" step="0.1" id="sup-kpi-'+kpi.id+'" value="'+(mgrAch!=null?mgrAch:'')+'" placeholder="Enter%" data-kpi-id="'+kpi.id+'" data-field="mgr_end_ach"></div>'+
+                '<div class="kpi-c"><input class="kpi-inp mgr" type="number" min="0" max="200" step="any" id="sup-kpi-'+kpi.id+'" value="'+(mgrAch!=null?mgrAch:'')+'" placeholder="Enter%" data-kpi-id="'+kpi.id+'" data-field="mgr_end_ach"></div>'+
                 '<div class="kpi-c" id="sup-kpi-rt-'+kpi.id+'">'+(mgrAch!=null?rBdg(getRating(mgrAch).r):'\u2014')+'</div></div>';
             });
           }

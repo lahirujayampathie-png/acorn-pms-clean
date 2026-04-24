@@ -24,7 +24,7 @@ router.get('/users', (req, res) => {
                     u.company, u.division, u.role, u.is_active,
                     u.must_change_pw, u.last_login, u.failed_attempts,
                     u.locked_until,
-                    CASE WHEN u.password_hash IS NULL THEN 0 ELSE 1 END as activated,
+                    CASE WHEN u.last_login IS NOT NULL AND u.must_change_pw=0 THEN 1 ELSE 0 END as activated,
                     m.name as manager_name
              FROM users u
              LEFT JOIN users m ON u.reports_to = m.emp_no
@@ -36,7 +36,7 @@ router.get('/users', (req, res) => {
   if (status === 'active')    { sql += ' AND u.is_active = 1'; }
   if (status === 'inactive')  { sql += ' AND u.is_active = 0'; }
   if (status === 'locked')    { sql += ' AND u.locked_until > ?'; params.push(Math.floor(Date.now()/1000)); }
-  if (status === 'not_activated') { sql += ' AND u.password_hash IS NULL'; }
+  if (status === 'not_activated') { sql += ' AND (u.last_login IS NULL OR u.must_change_pw=1)'; }
   if (q) { sql += ' AND (u.name LIKE ? OR u.designation LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
 
   sql += ' ORDER BY u.company, u.name';
@@ -242,12 +242,25 @@ router.get('/stats', (req, res) => {
   const stats = {
     total_users:     db.prepare('SELECT COUNT(*) as n FROM users').get().n,
     active_users:    db.prepare('SELECT COUNT(*) as n FROM users WHERE is_active = 1').get().n,
-    activated:       db.prepare('SELECT COUNT(*) as n FROM users WHERE password_hash IS NOT NULL').get().n,
-    not_activated:   db.prepare('SELECT COUNT(*) as n FROM users WHERE password_hash IS NULL').get().n,
+    // "activated" = employee has logged in AND set their own password (not just admin-created)
+    activated:       db.prepare('SELECT COUNT(*) as n FROM users WHERE is_active=1 AND last_login IS NOT NULL AND must_change_pw=0').get().n,
+    not_activated:   db.prepare('SELECT COUNT(*) as n FROM users WHERE is_active=1 AND (last_login IS NULL OR must_change_pw=1)').get().n,
     locked:          db.prepare('SELECT COUNT(*) as n FROM users WHERE locked_until > ?').get(Math.floor(Date.now()/1000)).n,
     by_role:         db.prepare('SELECT role, COUNT(*) as n FROM users GROUP BY role').all(),
-    by_company:      db.prepare('SELECT company, COUNT(*) as n FROM users GROUP BY company ORDER BY company').all(),
-    goal_stats:      db.prepare("SELECT status, COUNT(*) as n FROM goal_sheets WHERE cycle='2025-26' GROUP BY status").all(),
+    by_company:      db.prepare(`
+      SELECT u.company,
+             COUNT(*) as n,
+             SUM(CASE WHEN u.last_login IS NOT NULL AND u.must_change_pw=0 THEN 1 ELSE 0 END) as activated_n,
+             SUM(CASE WHEN u.last_login IS NULL OR u.must_change_pw=1 THEN 1 ELSE 0 END) as not_activated_n,
+             SUM(CASE WHEN gs.status='approved'  THEN 1 ELSE 0 END) as approved_n,
+             SUM(CASE WHEN gs.status='submitted' THEN 1 ELSE 0 END) as submitted_n,
+             SUM(CASE WHEN gs.status='draft'     THEN 1 ELSE 0 END) as draft_n
+      FROM users u
+      LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle='2026-27'
+      WHERE u.is_active=1
+      GROUP BY u.company ORDER BY u.company
+    `).all(),
+    goal_stats:      db.prepare("SELECT status, COUNT(*) as n FROM goal_sheets WHERE cycle='2026-27' GROUP BY status").all(),
     sessions_active: db.prepare('SELECT COUNT(*) as n FROM sessions WHERE expires_at > ?').get(Math.floor(Date.now()/1000)).n,
   };
   res.json(stats);
