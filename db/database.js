@@ -265,6 +265,10 @@ async function migrate() {
     -- Add promo recommendation to reviews
     ALTER TABLE reviews ADD COLUMN promo_recommended INTEGER DEFAULT 0;
     ALTER TABLE reviews ADD COLUMN promo_justification TEXT;
+    ALTER TABLE reviews ADD COLUMN promo_status TEXT DEFAULT 'pending';
+    ALTER TABLE reviews ADD COLUMN promo_decision_by INTEGER;
+    ALTER TABLE reviews ADD COLUMN promo_decision_at INTEGER;
+    ALTER TABLE reviews ADD COLUMN promo_decision_reason TEXT
     ALTER TABLE reviews ADD COLUMN employee_comments TEXT;
     ALTER TABLE reviews ADD COLUMN supervisor_agrees INTEGER DEFAULT 1;
     ALTER TABLE reviews ADD COLUMN supervisor_comments_review TEXT;
@@ -286,8 +290,48 @@ async function migrate() {
       updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
       UNIQUE(sheet_id, kpi_id, month, fy_year)
     );
-    CREATE INDEX IF NOT EXISTS idx_mp_sheet ON monthly_progress(sheet_id);
-    CREATE INDEX IF NOT EXISTS idx_mp_kpi ON monthly_progress(kpi_id);
+    -- Pushback support (supervisor returns review to employee)
+    ALTER TABLE reviews ADD COLUMN pushback_reason TEXT;
+
+    -- Goal Change Requests (employee requests mid-cycle changes after approval)
+    CREATE TABLE IF NOT EXISTS goal_change_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sheet_id INTEGER NOT NULL,
+      emp_no INTEGER NOT NULL,
+      cycle TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT NOT NULL,
+      requested_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      reviewed_at INTEGER,
+      reviewed_by INTEGER,
+      reviewer_comments TEXT,
+      kras_snapshot TEXT,
+      approved_kras_snapshot TEXT,
+      is_post_midyear INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_gcr_sheet ON goal_change_requests(sheet_id);
+    CREATE INDEX IF NOT EXISTS idx_gcr_emp ON goal_change_requests(emp_no);
+
+    -- Pre-Calibration Adjustments log
+    CREATE TABLE IF NOT EXISTS precal_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sheet_id INTEGER NOT NULL,
+      emp_no INTEGER NOT NULL,
+      adjusted_by INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      kpis_snapshot TEXT,
+      adjusted_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    ALTER TABLE reviews ADD COLUMN precal_adjusted INTEGER DEFAULT 0;
+    ALTER TABLE reviews ADD COLUMN precal_adjusted_at INTEGER
+    ALTER TABLE goal_sheets ADD COLUMN version INTEGER DEFAULT 1;
+    ALTER TABLE goal_sheets ADD COLUMN last_changed_at INTEGER;
+    ALTER TABLE goal_sheets ADD COLUMN change_count INTEGER DEFAULT 0;
+    ALTER TABLE reviews ADD COLUMN pushback_at INTEGER;
+    ALTER TABLE reviews ADD COLUMN pushback_by INTEGER;
+    ALTER TABLE reviews ADD COLUMN pushback_count INTEGER DEFAULT 0
   `;
   statements.split(';').map(s => s.trim()).filter(s => s.length > 0).forEach(stmt => {
     try { db.exec(stmt); } catch(e) { /* column may already exist */ }

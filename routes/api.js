@@ -116,7 +116,9 @@ router.get('/my/team', (req, res) => {
             r_mid.self_submitted_at as mid_submitted,
             r_mid.mgr_submitted_at as mid_mgr_submitted,
             r_ye.self_submitted_at as ye_submitted,
-            r_ye.mgr_submitted_at as ye_mgr_submitted
+            r_ye.mgr_submitted_at as ye_mgr_submitted,
+            r_ye.precal_adjusted as precal_adjusted,
+            r_ye.overall_score as overall_score
      FROM users u
      LEFT JOIN users m ON u.reports_to = m.emp_no
      LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
@@ -518,30 +520,50 @@ router.post('/reviews/:empNo/manager-review', (req, res) => {
 // CALIBRATION (HR only)
 // ════════════════════════════════════════════════════════════
 
-// GET /api/calibration — all employees with scores
+// GET /api/calibration — year-end only with emp/mgr/precal scores
 router.get('/calibration', requireRole('senior_manager'), (req, res) => {
   const { company } = req.query;
-  let sql = `SELECT u.emp_no, u.name, u.designation, u.company,
+  let sql = `SELECT u.emp_no, u.name, u.designation, u.company, u.grade,
                     gs.id as sheet_id, gs.status as goal_status,
                     r.overall_score, r.system_rating, r.override_rating,
                     r.final_rating, r.status as review_status,
-                    m.name as manager_name
+                    r.precal_adjusted,
+                    r.self_went_well, r.self_improve, r.employee_comments,
+                    r.mgr_comments, r.mgr_strengths, r.mgr_develop,
+                    r.promo_recommended,
+                    m.name as manager_name, m.emp_no as manager_emp_no
              FROM users u
              LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-             LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'mid_year'
+             LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'year_end'
              LEFT JOIN users m ON u.reports_to = m.emp_no
              WHERE u.is_active = 1`;
   const params = [CYCLE];
   if (company) { sql += ' AND u.company = ?'; params.push(company); }
   sql += ' ORDER BY u.company, u.name';
 
-  res.json(db.prepare(sql).all(...params));
+  const rows = db.prepare(sql).all(...params);
+
+  // For each row, compute emp_score and mgr_score separately
+  const result = rows.map(row => {
+    if (!row.sheet_id) return {...row, emp_score: null, mgr_score: null, ye_score: null};
+    const empScores = computeScores(row.sheet_id, 'end');
+    const mgrScores = computeScores(row.sheet_id, 'end');
+    return {
+      ...row,
+      emp_score: empScores.overall,
+      mgr_score: mgrScores.mgr_overall || empScores.overall, // use overall as fallback
+      ye_score: row.overall_score
+    };
+  });
+
+  res.json(result);
 });
 
-// POST /api/calibration/set-rating — HR sets override rating
+// POST /api/calibration/set-rating — HR sets override rating (year-end only)
 router.post('/calibration/set-rating', requireHR, (req, res) => {
-  const { emp_no, review_type = 'mid_year', override_rating } = req.body;
-  const validRatings = ['A', 'B', 'C', 'D', 'E', null];
+  const { emp_no, override_rating } = req.body;
+  const review_type = 'year_end'; // always year-end
+  const validRatings = ['A', 'B', 'C', 'D', 'E', null, ''];
   if (!validRatings.includes(override_rating)) {
     return res.status(400).json({ error: 'Invalid rating.' });
   }
@@ -551,19 +573,23 @@ router.post('/calibration/set-rating', requireHR, (req, res) => {
   if (!sheet) return res.status(404).json({ error: 'No goal sheet.' });
 
   const now = Math.floor(Date.now()/1000);
-  const final = override_rating || db.prepare(
-    'SELECT system_rating FROM reviews WHERE sheet_id = ? AND review_type = ?'
-  ).get(sheet.id, review_type)?.system_rating;
+  const overrideVal = override_rating || null;
+  const sysRating = db.prepare('SELECT system_rating FROM reviews WHERE sheet_id=? AND review_type=?')
+    .get(sheet.id, review_type)?.system_rating;
+  const final = overrideVal || sysRating;
 
-  db.prepare(
-    `UPDATE reviews SET override_rating=?, final_rating=?, calibrated_by=?, calibrated_at=?,
-     status='calibrated', updated_at=?
-     WHERE sheet_id=? AND review_type=?`
-  ).run(override_rating, final, req.user.emp_no, now, now, sheet.id, review_type);
+  const existing = db.prepare('SELECT id FROM reviews WHERE sheet_id=? AND review_type=?').get(sheet.id, review_type);
+  if (existing) {
+    db.prepare(`UPDATE reviews SET override_rating=?,final_rating=?,calibrated_by=?,calibrated_at=?,status='calibrated',updated_at=? WHERE id=?`)
+      .run(overrideVal, final, req.user.emp_no, now, now, existing.id);
+  } else {
+    db.prepare(`INSERT INTO reviews(sheet_id,review_type,status,override_rating,final_rating,calibrated_by,calibrated_at,created_at,updated_at) VALUES(?,'year_end','calibrated',?,?,?,?,?,?)`)
+      .run(sheet.id, overrideVal, final, req.user.emp_no, now, now, now);
+  }
 
   db.logAudit(req.user.id, 'rating_calibrated', 'review', sheet.id,
-    { emp_no, override_rating, final }, req.ip);
-  res.json({ success: true });
+    { emp_no, override_rating: overrideVal, final }, req.ip);
+  res.json({ success: true, final_rating: final });
 });
 
 // POST /api/calibration/publish — unlock ratings (HR)
@@ -732,385 +758,40 @@ function getSubtree(managerEmpNo, allEmps) {
 function canAccessEmployee(u, targetEmpNo) {
   if (u.role === 'hr_admin') return true;
   if (u.emp_no === targetEmpNo) return true;
+  if (ROLE_LEVELS[u.role] >= ROLE_LEVELS['exco']) return true; // exco can view everyone
   if (ROLE_LEVELS[u.role] >= ROLE_LEVELS['supervisor'] && isInHierarchy(targetEmpNo, u.emp_no)) return true;
   return false;
 }
 
-// ════════════════════════════════════════════════════════════
-// EXPORT / DOWNLOAD ROUTES  (HR only)
-// GET /api/export/:slug?format=csv|pdf
-// All routes stream a CSV file. PDF is the same CSV for now
-// (front-end can convert; full PDF rendering requires puppeteer
-//  which is not installed — CSV is the fully usable deliverable).
-// ════════════════════════════════════════════════════════════
-
-function csvEscape(v) {
-  if (v === null || v === undefined) return '';
-  const s = String(v);
-  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-    return '"' + s.replace(/"/g, '""') + '"';
+// POST /api/reviews/:empNo/pushback — supervisor pushes review back to employee for revision
+router.post('/reviews/:empNo/pushback', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const emp = db.prepare('SELECT reports_to FROM users WHERE emp_no=?').get(empNo);
+  if (req.user.role !== 'hr_admin' && emp?.reports_to !== req.user.emp_no) {
+    return res.status(403).json({error:'Only the direct supervisor or HR can push back this review.'});
   }
-  return s;
-}
-function csvRow(arr) { return arr.map(csvEscape).join(',') + '\r\n'; }
-function sendCSV(res, filename, rows) {
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  rows.forEach(r => res.write(r));
-  res.end();
-}
-
-// GET /api/export/full-pms-status
-router.get('/export/full-pms-status', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.cluster,
-           m.name as manager,
-           gs.status as goal_status,
-           gs.submitted_at, gs.approved_at,
-           r_mid.status as mid_status, r_mid.overall_score as mid_score,
-           r_mid.system_rating as mid_rating, r_mid.final_rating as mid_final,
-           r_ye.status as ye_status, r_ye.overall_score as ye_score,
-           r_ye.system_rating as ye_rating, r_ye.final_rating as ye_final
-    FROM users u
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    LEFT JOIN reviews r_mid ON r_mid.sheet_id = gs.id AND r_mid.review_type = 'mid_year'
-    LEFT JOIN reviews r_ye  ON r_ye.sheet_id  = gs.id AND r_ye.review_type  = 'year_end'
-    WHERE u.is_active = 1
-    ORDER BY u.cluster, u.company, u.name
-  `).all(CYCLE);
-
-  const out = [];
-  out.push(csvRow(['Emp No','Name','Designation','Grade','Department','Company','Cluster','Manager',
-    'Goal Status','Goals Submitted At','Goals Approved At',
-    'Mid-Year Status','Mid-Year Score','Mid-Year System Rating','Mid-Year Final Rating',
-    'Year-End Status','Year-End Score','Year-End System Rating','Year-End Final Rating']));
-  rows.forEach(r => {
-    out.push(csvRow([
-      r.emp_no, r.name, r.designation, r.grade, r.dept, r.company, r.cluster, r.manager,
-      r.goal_status || 'not_started',
-      r.submitted_at ? new Date(r.submitted_at*1000).toISOString().slice(0,10) : '',
-      r.approved_at  ? new Date(r.approved_at*1000).toISOString().slice(0,10)  : '',
-      r.mid_status || '', r.mid_score || '', r.mid_rating || '', r.mid_final || '',
-      r.ye_status  || '', r.ye_score  || '', r.ye_rating  || '', r.ye_final  || ''
-    ]));
-  });
-  sendCSV(res, `acorn-full-pms-status-${CYCLE}.csv`, out);
+  const { review_type, reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({error:'A reason is required when pushing back a review.'});
+  const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) return res.status(404).json({error:'No goal sheet found.'});
+  const now = Math.floor(Date.now()/1000);
+  const existing = db.prepare('SELECT * FROM reviews WHERE sheet_id=? AND review_type=?').get(sheet.id, review_type);
+  if (existing) {
+    try {
+      db.prepare(`UPDATE reviews SET status='pushed_back', pushback_reason=?, pushback_at=?, pushback_by=?, self_submitted_at=NULL, updated_at=? WHERE id=?`)
+        .run(reason, now, req.user.emp_no, now, existing.id);
+    } catch(e) {
+      // pushback columns may not exist — add them
+      db.prepare(`UPDATE reviews SET status='pushed_back', updated_at=? WHERE id=?`).run(now, existing.id);
+    }
+  } else {
+    db.prepare(`INSERT INTO reviews(sheet_id,review_type,status,pushback_reason,pushback_at,pushback_by,created_at,updated_at) VALUES(?,?,'pushed_back',?,?,?,?,?)`)
+      .run(sheet.id, review_type, reason, now, req.user.emp_no, now, now);
+  }
+  db.logAudit(req.user.id, 'review_pushed_back', 'review', sheet.id, {empNo, review_type, reason}, req.ip);
+  res.json({success:true});
 });
 
-// GET /api/export/goal-completion-report
-router.get('/export/goal-completion-report', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.company, COUNT(*) as total,
-           SUM(CASE WHEN gs.status='approved'  THEN 1 ELSE 0 END) as approved,
-           SUM(CASE WHEN gs.status='submitted' THEN 1 ELSE 0 END) as submitted,
-           SUM(CASE WHEN gs.status='draft'     THEN 1 ELSE 0 END) as draft,
-           SUM(CASE WHEN gs.id IS NULL          THEN 1 ELSE 0 END) as not_started
-    FROM users u
-    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    WHERE u.is_active = 1
-    GROUP BY u.company ORDER BY u.company
-  `).all(CYCLE);
-
-  const out = [];
-  out.push(csvRow(['Company','Total Staff','Approved','Submitted/Pending','Draft','Not Started','Approval %']));
-  rows.forEach(r => {
-    const pct = r.total > 0 ? Math.round(r.approved / r.total * 100) : 0;
-    out.push(csvRow([r.company, r.total, r.approved, r.submitted, r.draft, r.not_started, pct + '%']));
-  });
-  sendCSV(res, `acorn-goal-completion-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/rating-distribution
-router.get('/export/rating-distribution', requireHR, (req, res) => {
-  const phases = ['mid_year', 'year_end'];
-  const out = [];
-  out.push(csvRow(['Phase','Rating','Label','Count','Percentage']));
-  phases.forEach(phase => {
-    const rows = db.prepare(`
-      SELECT r.system_rating as rating, COUNT(*) as cnt
-      FROM reviews r
-      JOIN goal_sheets gs ON r.sheet_id = gs.id AND gs.cycle = ?
-      WHERE r.review_type = ? AND r.system_rating IS NOT NULL
-      GROUP BY r.system_rating ORDER BY r.system_rating
-    `).all(CYCLE, phase);
-    const total = rows.reduce((s, r) => s + r.cnt, 0);
-    const labels = {A:'Exceptional',B:'Strong',C:'Competent',D:'Inconsistent',E:'Below Expectations'};
-    ['A','B','C','D','E'].forEach(rt => {
-      const row = rows.find(r => r.rating === rt);
-      const cnt = row ? row.cnt : 0;
-      const pct = total > 0 ? Math.round(cnt/total*100) : 0;
-      out.push(csvRow([phase === 'mid_year' ? 'Mid-Year' : 'Year-End', rt, labels[rt] || rt, cnt, pct + '%']));
-    });
-  });
-  sendCSV(res, `acorn-rating-distribution-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/mid-year-appraisal-summary
-router.get('/export/mid-year-appraisal-summary', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.company, u.grade,
-           m.name as manager,
-           r.overall_score, r.system_rating, r.override_rating, r.final_rating,
-           r.self_went_well, r.self_improve, r.self_support_needed,
-           r.mgr_comments, r.mgr_strengths, r.mgr_develop,
-           r.self_submitted_at, r.mgr_submitted_at,
-           r.promo_recommended
-    FROM users u
-    JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'mid_year'
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    WHERE u.is_active = 1
-    ORDER BY u.company, u.name
-  `).all(CYCLE);
-
-  const out = [];
-  out.push(csvRow(['Emp No','Name','Designation','Grade','Company','Manager',
-    'System Rating','Override Rating','Final Rating',
-    'Overall Score','Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
-    'Manager Comments','Manager Strengths','Manager Development',
-    'Self Submitted','Manager Submitted','Promotion Recommended']));
-  rows.forEach(r => {
-    out.push(csvRow([
-      r.emp_no, r.name, r.designation, r.grade, r.company, r.manager,
-      r.system_rating || '', r.override_rating || '', r.final_rating || '',
-      r.overall_score || '', r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
-      r.mgr_comments || '', r.mgr_strengths || '', r.mgr_develop || '',
-      r.self_submitted_at ? new Date(r.self_submitted_at*1000).toISOString().slice(0,10) : '',
-      r.mgr_submitted_at  ? new Date(r.mgr_submitted_at*1000).toISOString().slice(0,10)  : '',
-      r.promo_recommended ? 'Yes' : 'No'
-    ]));
-  });
-  sendCSV(res, `acorn-mid-year-summary-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/year-end-appraisal-summary
-router.get('/export/year-end-appraisal-summary', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.company, u.grade,
-           m.name as manager,
-           r.overall_score, r.system_rating, r.override_rating, r.final_rating,
-           r.self_went_well, r.self_improve, r.self_support_needed,
-           r.mgr_comments, r.mgr_strengths, r.mgr_develop,
-           r.self_submitted_at, r.mgr_submitted_at,
-           r.promo_recommended, r.promo_justification
-    FROM users u
-    JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'year_end'
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    WHERE u.is_active = 1
-    ORDER BY u.company, u.name
-  `).all(CYCLE);
-
-  const out = [];
-  out.push(csvRow(['Emp No','Name','Designation','Grade','Company','Manager',
-    'System Rating','Override Rating','Final Rating',
-    'Overall Score','Self: What Went Well','Self: Areas to Improve','Self: Support Needed',
-    'Manager Comments','Manager Strengths','Manager Development',
-    'Self Submitted','Manager Submitted','Promotion Recommended','Promotion Justification']));
-  rows.forEach(r => {
-    out.push(csvRow([
-      r.emp_no, r.name, r.designation, r.grade, r.company, r.manager,
-      r.system_rating || '', r.override_rating || '', r.final_rating || '',
-      r.overall_score || '', r.self_went_well || '', r.self_improve || '', r.self_support_needed || '',
-      r.mgr_comments || '', r.mgr_strengths || '', r.mgr_develop || '',
-      r.self_submitted_at ? new Date(r.self_submitted_at*1000).toISOString().slice(0,10) : '',
-      r.mgr_submitted_at  ? new Date(r.mgr_submitted_at*1000).toISOString().slice(0,10)  : '',
-      r.promo_recommended ? 'Yes' : 'No',
-      r.promo_justification || ''
-    ]));
-  });
-  sendCSV(res, `acorn-year-end-summary-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/calibration-sheet
-router.get('/export/calibration-sheet', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.grade, u.company, u.cluster,
-           m.name as manager,
-           r_mid.overall_score as mid_score, r_mid.system_rating as mid_sys,
-           r_mid.override_rating as mid_override, r_mid.final_rating as mid_final,
-           r_ye.overall_score as ye_score, r_ye.system_rating as ye_sys,
-           r_ye.override_rating as ye_override, r_ye.final_rating as ye_final,
-           cal.name as calibrated_by_name, r_mid.calibrated_at
-    FROM users u
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    LEFT JOIN reviews r_mid ON r_mid.sheet_id = gs.id AND r_mid.review_type = 'mid_year'
-    LEFT JOIN reviews r_ye  ON r_ye.sheet_id  = gs.id AND r_ye.review_type  = 'year_end'
-    LEFT JOIN users cal ON r_mid.calibrated_by = cal.emp_no
-    WHERE u.is_active = 1
-    ORDER BY u.cluster, u.company, u.name
-  `).all(CYCLE);
-
-  const out = [];
-  out.push(csvRow(['Emp No','Name','Designation','Grade','Company','Cluster','Manager',
-    'Mid-Year Score','Mid-Year System','Mid-Year Override','Mid-Year Final',
-    'Year-End Score','Year-End System','Year-End Override','Year-End Final',
-    'Calibrated By','Calibrated At']));
-  rows.forEach(r => {
-    out.push(csvRow([
-      r.emp_no, r.name, r.designation, r.grade, r.company, r.cluster, r.manager,
-      r.mid_score || '', r.mid_sys || '', r.mid_override || '', r.mid_final || '',
-      r.ye_score  || '', r.ye_sys  || '', r.ye_override  || '', r.ye_final  || '',
-      r.calibrated_by_name || '',
-      r.calibrated_at ? new Date(r.calibrated_at*1000).toISOString().slice(0,10) : ''
-    ]));
-  });
-  sendCSV(res, `acorn-calibration-sheet-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/company-grading  — per-company A–E breakdown both phases
-router.get('/export/company-grading', requireHR, (req, res) => {
-  const phases = ['mid_year', 'year_end'];
-  const out = [];
-  out.push(csvRow(['Company','Phase','Total Reviewed','A – Exceptional','B – Strong','C – Competent','D – Inconsistent','E – Below Expectations','% A+B (High Performers)']));
-  phases.forEach(phase => {
-    const rows = db.prepare(`
-      SELECT u.company,
-             SUM(CASE WHEN r.final_rating='A' THEN 1 ELSE 0 END) as rA,
-             SUM(CASE WHEN r.final_rating='B' THEN 1 ELSE 0 END) as rB,
-             SUM(CASE WHEN r.final_rating='C' THEN 1 ELSE 0 END) as rC,
-             SUM(CASE WHEN r.final_rating='D' THEN 1 ELSE 0 END) as rD,
-             SUM(CASE WHEN r.final_rating='E' THEN 1 ELSE 0 END) as rE,
-             COUNT(r.id) as total
-      FROM users u
-      JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-      JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ? AND r.final_rating IS NOT NULL
-      WHERE u.is_active = 1
-      GROUP BY u.company ORDER BY u.company
-    `).all(CYCLE, phase);
-    rows.forEach(r => {
-      const hi = r.total > 0 ? Math.round((r.rA + r.rB) / r.total * 100) : 0;
-      out.push(csvRow([r.company, phase === 'mid_year' ? 'Mid-Year' : 'Year-End',
-        r.total, r.rA, r.rB, r.rC, r.rD, r.rE, hi + '%']));
-    });
-  });
-  sendCSV(res, `acorn-company-grading-${CYCLE}.csv`, out);
-});
-
-// GET /api/export/employee-directory
-router.get('/export/employee-directory', requireHR, (req, res) => {
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.division, u.cluster,
-           u.role, m.name as manager, m.emp_no as manager_emp_no
-    FROM users u
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    WHERE u.is_active = 1
-    ORDER BY u.cluster, u.company, u.dept, u.name
-  `).all();
-  const out = [];
-  out.push(csvRow(['Emp No','Name','Designation','Grade','Department','Company','Division','Cluster','System Role','Manager Name','Manager Emp No']));
-  rows.forEach(r => {
-    out.push(csvRow([r.emp_no, r.name, r.designation, r.grade, r.dept, r.company,
-      r.division, r.cluster, r.role, r.manager || '', r.manager_emp_no || '']));
-  });
-  sendCSV(res, `acorn-employee-directory.csv`, out);
-});
-
-// GET /api/reports/grading-data — JSON for the reports page grading table
-// GET /api/reports/goal-drill?company=X
-router.get('/reports/goal-drill', requireHR, (req, res) => {
-  const { company } = req.query;
-  if (!company) return res.status(400).json({ error: 'company required' });
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.grade,
-           m.name as manager,
-           gs.status as goal_status,
-           gs.submitted_at, gs.approved_at
-    FROM users u
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    WHERE u.is_active = 1 AND u.company = ?
-    ORDER BY u.name
-  `).all(CYCLE, company);
-  res.json(rows);
-});
-
-// GET /api/reports/company-drill?company=X&phase=mid_year|year_end
-router.get('/reports/company-drill', requireHR, (req, res) => {
-  const { company, phase } = req.query;
-  if (!company || !phase) return res.status(400).json({ error: 'company and phase required' });
-  const rows = db.prepare(`
-    SELECT u.emp_no, u.name, u.designation, u.grade,
-           m.name as manager,
-           gs.status as goal_status,
-           r.status as review_status,
-           r.self_submitted_at, r.mgr_submitted_at,
-           r.overall_score, r.system_rating, r.final_rating
-    FROM users u
-    LEFT JOIN users m ON u.reports_to = m.emp_no
-    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-    LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ?
-    WHERE u.is_active = 1 AND u.company = ?
-    ORDER BY u.name
-  `).all(CYCLE, phase, company);
-  res.json(rows);
-});
-
-router.get('/reports/grading-data', requireHR, (req, res) => {
-  const phases = ['mid_year', 'year_end'];
-  const result = {};
-  phases.forEach(phase => {
-    const rows = db.prepare(`
-      SELECT u.company,
-             SUM(CASE WHEN COALESCE(r.final_rating, r.system_rating)='A' THEN 1 ELSE 0 END) as rA,
-             SUM(CASE WHEN COALESCE(r.final_rating, r.system_rating)='B' THEN 1 ELSE 0 END) as rB,
-             SUM(CASE WHEN COALESCE(r.final_rating, r.system_rating)='C' THEN 1 ELSE 0 END) as rC,
-             SUM(CASE WHEN COALESCE(r.final_rating, r.system_rating)='D' THEN 1 ELSE 0 END) as rD,
-             SUM(CASE WHEN COALESCE(r.final_rating, r.system_rating)='E' THEN 1 ELSE 0 END) as rE,
-             COUNT(r.id) as total
-      FROM users u
-      JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-      JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ?
-        AND COALESCE(r.final_rating, r.system_rating) IS NOT NULL
-      WHERE u.is_active = 1
-      GROUP BY u.company ORDER BY u.company
-    `).all(CYCLE, phase);
-    result[phase] = rows;
-  });
-
-  // Also get org-wide distributions for bar charts
-  const dist = {};
-  phases.forEach(phase => {
-    const rows = db.prepare(`
-      SELECT COALESCE(r.final_rating, r.system_rating) as rating, COUNT(*) as cnt
-      FROM reviews r
-      JOIN goal_sheets gs ON r.sheet_id = gs.id AND gs.cycle = ?
-      WHERE r.review_type = ? AND COALESCE(r.final_rating, r.system_rating) IS NOT NULL
-      GROUP BY 1 ORDER BY 1
-    `).all(CYCLE, phase);
-    const total = rows.reduce((s,r) => s+r.cnt, 0);
-    dist[phase] = {total, byRating: {}};
-    rows.forEach(r => { dist[phase].byRating[r.rating] = r.cnt; });
-  });
-
-  // Appraisal submission status per company per phase
-  // status breakdown: self_submitted, mgr_submitted (complete), in_progress, not_started
-  const reviewStatus = {};
-  phases.forEach(phase => {
-    const rows = db.prepare(`
-      SELECT u.company,
-             COUNT(u.emp_no) as headcount,
-             SUM(CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END) as has_review,
-             SUM(CASE WHEN r.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mgr_submitted,
-             SUM(CASE WHEN r.self_submitted_at IS NOT NULL AND r.mgr_submitted_at IS NULL THEN 1 ELSE 0 END) as self_only,
-             SUM(CASE WHEN r.id IS NOT NULL AND r.self_submitted_at IS NULL THEN 1 ELSE 0 END) as in_progress,
-             SUM(CASE WHEN r.id IS NULL AND gs.id IS NOT NULL THEN 1 ELSE 0 END) as not_started_goals,
-             SUM(CASE WHEN gs.id IS NULL THEN 1 ELSE 0 END) as no_goals
-      FROM users u
-      LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
-      LEFT JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = ?
-      WHERE u.is_active = 1
-      GROUP BY u.company ORDER BY u.company
-    `).all(CYCLE, phase);
-    reviewStatus[phase] = rows;
-  });
-
-  res.json({ byCompany: result, distribution: dist, reviewStatus });
-});
-
-module.exports = router;
 
 // ════════════════════════════════════════════════════════════
 // CYCLE SETTINGS (HR controls which windows are open)
@@ -1427,3 +1108,635 @@ router.post('/reviews/:empNo/manager-save', (req, res) => {
   res.json({success:true});
 });
 
+
+// ════════════════════════════════════════════════════════════
+// PHASE 2 — GOAL CHANGE REQUESTS
+// ════════════════════════════════════════════════════════════
+
+// GET /api/goals/:empNo/change-requests — list all change requests for an employee
+router.get('/goals/:empNo/change-requests', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  if (!canAccessEmployee(req.user, empNo)) return res.status(403).json({error:'Access denied.'});
+  const reqs = db.prepare(`
+    SELECT gcr.*, u.name as reviewed_by_name
+    FROM goal_change_requests gcr
+    LEFT JOIN users u ON u.emp_no = gcr.reviewed_by
+    WHERE gcr.emp_no = ? AND gcr.cycle = ?
+    ORDER BY gcr.requested_at DESC
+  `).all(empNo, CYCLE);
+  res.json(reqs);
+});
+
+// POST /api/goals/:empNo/change-requests — employee submits a change request
+router.post('/goals/:empNo/change-requests', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  if (req.user.emp_no !== empNo) return res.status(403).json({error:'Can only submit your own change request.'});
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({error:'Please provide a reason for the change request.'});
+  const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) return res.status(404).json({error:'No goal sheet found.'});
+  if (!['approved','locked'].includes(sheet.status)) return res.status(400).json({error:'Goals must be approved before requesting changes.'});
+
+  // Check no pending request already exists
+  const pending = db.prepare("SELECT id FROM goal_change_requests WHERE emp_no=? AND cycle=? AND status='pending'").get(empNo, CYCLE);
+  if (pending) return res.status(400).json({error:'You already have a pending change request. Please wait for it to be reviewed.'});
+
+  // Snapshot current KRAs
+  const kras = db.prepare('SELECT * FROM kras WHERE sheet_id=?').all(sheet.id);
+  const krasWithKpis = kras.map(k => ({
+    ...k,
+    kpis: db.prepare('SELECT * FROM kpis WHERE kra_id=?').all(k.id)
+  }));
+
+  // Check if post mid-year
+  const midRev = db.prepare("SELECT id FROM reviews WHERE sheet_id=? AND review_type='mid_year' AND self_submitted_at IS NOT NULL").get(sheet.id);
+  const now = Math.floor(Date.now()/1000);
+
+  db.prepare(`INSERT INTO goal_change_requests(sheet_id,emp_no,cycle,status,reason,kras_snapshot,is_post_midyear,requested_at,created_at,updated_at)
+    VALUES(?,?,?,'pending',?,?,?,?,?,?)`)
+    .run(sheet.id, empNo, CYCLE, reason.trim(), JSON.stringify(krasWithKpis), midRev?1:0, now, now, now);
+
+  db.logAudit(req.user.id,'goal_change_requested','goal_sheet',sheet.id,{reason:reason.trim(), post_midyear:!!midRev},req.ip);
+  res.json({success:true, post_midyear:!!midRev});
+});
+
+// POST /api/goals/:empNo/change-requests/:reqId/approve — supervisor/HR approves change request
+router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const reqId = parseInt(req.params.reqId);
+  const emp = db.prepare('SELECT reports_to FROM users WHERE emp_no=?').get(empNo);
+  if (req.user.role !== 'hr_admin' && emp?.reports_to !== req.user.emp_no) {
+    return res.status(403).json({error:'Only the direct supervisor or HR can approve change requests.'});
+  }
+  const { comments } = req.body;
+  const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
+  if (!cr) return res.status(404).json({error:'Change request not found.'});
+  if (cr.status !== 'pending') return res.status(400).json({error:'This change request has already been reviewed.'});
+
+  const now = Math.floor(Date.now()/1000);
+  // Reopen the goal sheet for editing
+  db.prepare("UPDATE goal_sheets SET status='approved',last_changed_at=?,change_count=COALESCE(change_count,0)+1,updated_at=? WHERE id=?")
+    .run(now, now, cr.sheet_id);
+  db.prepare(`UPDATE goal_change_requests SET status='approved',reviewed_at=?,reviewed_by=?,reviewer_comments=?,updated_at=? WHERE id=?`)
+    .run(now, req.user.emp_no, comments||'', now, reqId);
+
+  db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
+  res.json({success:true});
+});
+
+// POST /api/goals/:empNo/change-requests/:reqId/reject — supervisor/HR rejects change request
+router.post('/goals/:empNo/change-requests/:reqId/reject', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const reqId = parseInt(req.params.reqId);
+  const emp = db.prepare('SELECT reports_to FROM users WHERE emp_no=?').get(empNo);
+  if (req.user.role !== 'hr_admin' && emp?.reports_to !== req.user.emp_no) {
+    return res.status(403).json({error:'Only the direct supervisor or HR can reject change requests.'});
+  }
+  const { comments } = req.body;
+  if (!comments || !comments.trim()) return res.status(400).json({error:'Please provide a reason for rejecting the change request.'});
+  const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
+  if (!cr) return res.status(404).json({error:'Change request not found.'});
+  if (cr.status !== 'pending') return res.status(400).json({error:'This change request has already been reviewed.'});
+
+  const now = Math.floor(Date.now()/1000);
+  db.prepare(`UPDATE goal_change_requests SET status='rejected',reviewed_at=?,reviewed_by=?,reviewer_comments=?,updated_at=? WHERE id=?`)
+    .run(now, req.user.emp_no, comments.trim(), now, reqId);
+
+  db.logAudit(req.user.id,'goal_change_rejected','goal_sheet',cr.sheet_id,{req_id:reqId,reason:comments},req.ip);
+  res.json({success:true});
+});
+
+// GET /api/goals/change-requests/pending — HR gets all pending change requests
+router.get('/goals/change-requests/pending', requireHR, (req, res) => {
+  const reqs = db.prepare(`
+    SELECT gcr.*, u.name as emp_name, u.designation, u.company,
+           sup.name as supervisor_name, sup.emp_no as supervisor_emp_no
+    FROM goal_change_requests gcr
+    JOIN users u ON u.emp_no = gcr.emp_no
+    LEFT JOIN users sup ON sup.emp_no = u.reports_to
+    WHERE gcr.cycle = ? AND gcr.status = 'pending'
+    ORDER BY gcr.is_post_midyear DESC, gcr.requested_at ASC
+  `).all(CYCLE);
+  res.json(reqs);
+});
+
+// ════════════════════════════════════════════════════════════
+// PHASE 2 — PROMOTIONS VIEW
+// ════════════════════════════════════════════════════════════
+
+// GET /api/promotions — all employees recommended for promotion with full details
+router.get('/promotions', requireRole('senior_manager'), (req, res) => {
+  const { company } = req.query;
+  const params = [CYCLE];
+  let sql, rows;
+
+  // Try full query with new columns first, fall back if they don't exist yet
+  try {
+    sql = `
+      SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.cluster,
+             r.overall_score, r.system_rating, r.final_rating,
+             r.promo_recommended, r.promo_justification,
+             r.promo_status, r.promo_decision_reason, r.promo_decision_at,
+             r.self_went_well, r.self_improve, r.employee_comments,
+             r.mgr_comments, r.mgr_strengths, r.mgr_develop,
+             r.self_submitted_at, r.mgr_submitted_at, r.mgr_reviewed_by,
+             sup.name as supervisor_name, sup.emp_no as supervisor_emp_no,
+             dec.name as decided_by_name,
+             gs.status as goal_status
+      FROM users u
+      JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+      JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'year_end'
+      LEFT JOIN users sup ON sup.emp_no = u.reports_to
+      LEFT JOIN users dec ON dec.emp_no = r.promo_decision_by
+      WHERE u.is_active = 1 AND r.promo_recommended = 1`;
+    if (company) { sql += ' AND u.company=?'; params.push(company); }
+    sql += ' ORDER BY u.company, r.overall_score DESC';
+    rows = db.prepare(sql).all(...params);
+  } catch(e) {
+    // Fallback without new columns (pre-migration)
+    try {
+      sql = `
+        SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.cluster,
+               r.overall_score, r.system_rating, r.final_rating,
+               r.promo_recommended, r.promo_justification,
+               r.mgr_comments, r.mgr_strengths, r.mgr_develop,
+               r.self_went_well, r.self_improve,
+               sup.name as supervisor_name, sup.emp_no as supervisor_emp_no,
+               gs.status as goal_status
+        FROM users u
+        JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+        JOIN reviews r ON r.sheet_id = gs.id AND r.review_type = 'year_end'
+        LEFT JOIN users sup ON sup.emp_no = u.reports_to
+        WHERE u.is_active = 1 AND r.promo_recommended = 1`;
+      const params2 = [CYCLE];
+      if (company) { sql += ' AND u.company=?'; params2.push(company); }
+      sql += ' ORDER BY u.company, r.overall_score DESC';
+      rows = db.prepare(sql).all(...params2);
+    } catch(e2) {
+      rows = [];
+    }
+  }
+  res.json(rows);
+});
+
+// POST /api/promotions/:empNo/decide — HR approves or rejects promotion recommendation
+router.post('/promotions/:empNo/decide', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const { decision, reason } = req.body; // decision: 'approved' | 'rejected'
+  if (!['approved','rejected'].includes(decision)) {
+    return res.status(400).json({error:'Decision must be approved or rejected.'});
+  }
+  if (decision === 'rejected' && (!reason||!reason.trim())) {
+    return res.status(400).json({error:'A reason is required when rejecting a promotion.'});
+  }
+  const sheet = db.prepare('SELECT id FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) return res.status(404).json({error:'No goal sheet found.'});
+  const now = Math.floor(Date.now()/1000);
+  try {
+    db.prepare(`UPDATE reviews SET promo_status=?, promo_decision_by=?, promo_decision_at=?, promo_decision_reason=?, updated_at=? WHERE sheet_id=? AND review_type='year_end'`)
+      .run(decision, req.user.emp_no, now, reason||null, now, sheet.id);
+  } catch(e) {
+    // columns not yet migrated — try minimal update
+    try {
+      db.prepare(`UPDATE reviews SET updated_at=? WHERE sheet_id=? AND review_type='year_end'`).run(now, sheet.id);
+    } catch(e2) { /* ignore */ }
+    return res.status(500).json({error:'DB columns not yet migrated. Please restart the server to apply migrations.'});
+  }
+  db.logAudit(req.user.id, 'promotion_'+decision, 'review', sheet.id, {empNo, reason}, req.ip);
+  res.json({success:true});
+});
+
+// ════════════════════════════════════════════════════════════
+// PHASE 2 — HISTORICAL PERFORMANCE
+// ════════════════════════════════════════════════════════════
+
+// GET /api/performance/history/:empNo — get all cycles' data for an employee
+router.get('/performance/history/:empNo', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  if (!canAccessEmployee(req.user, empNo)) return res.status(403).json({error:'Access denied.'});
+
+  const sheets = db.prepare(`
+    SELECT gs.id, gs.cycle, gs.status, gs.approved_at,
+           r_mid.overall_score as mid_score, r_mid.system_rating as mid_rating,
+           r_mid.self_went_well as mid_went_well, r_mid.self_improve as mid_improve,
+           r_mid.mgr_comments as mid_mgr_comments,
+           r_ye.overall_score as ye_score, r_ye.system_rating as ye_rating,
+           r_ye.final_rating, r_ye.self_went_well as ye_went_well,
+           r_ye.mgr_comments as ye_mgr_comments,
+           r_ye.promo_recommended, r_ye.mgr_reviewed_by
+    FROM goal_sheets gs
+    LEFT JOIN reviews r_mid ON r_mid.sheet_id = gs.id AND r_mid.review_type = 'mid_year'
+    LEFT JOIN reviews r_ye ON r_ye.sheet_id = gs.id AND r_ye.review_type = 'year_end'
+    WHERE gs.emp_no = ?
+    ORDER BY gs.cycle DESC
+  `).all(empNo);
+
+  // For each sheet, get KRA/KPI structure
+  const history = sheets.map(s => {
+    const kras = db.prepare('SELECT * FROM kras WHERE sheet_id=?').all(s.id);
+    return {
+      ...s,
+      kras: kras.map(k => ({
+        ...k,
+        kpis: db.prepare('SELECT * FROM kpis WHERE kra_id=?').all(k.id)
+      }))
+    };
+  });
+
+  res.json(history);
+});
+
+// GET /api/export/my-history — employee downloads their own performance history
+router.get('/export/my-history', (req, res) => {
+  const empNo = req.user.emp_no;
+  const sheets = db.prepare(`
+    SELECT gs.id, gs.cycle, gs.status,
+           r_mid.overall_score as mid_score, r_mid.system_rating as mid_rating,
+           r_mid.self_went_well as mid_went_well, r_mid.self_improve as mid_improve,
+           r_mid.mgr_comments as mid_mgr_comments,
+           r_ye.overall_score as ye_score, r_ye.system_rating as ye_rating,
+           r_ye.final_rating, r_ye.self_went_well as ye_went_well,
+           r_ye.mgr_comments as ye_mgr_comments
+    FROM goal_sheets gs
+    LEFT JOIN reviews r_mid ON r_mid.sheet_id=gs.id AND r_mid.review_type='mid_year'
+    LEFT JOIN reviews r_ye ON r_ye.sheet_id=gs.id AND r_ye.review_type='year_end'
+    WHERE gs.emp_no=? ORDER BY gs.cycle DESC
+  `).all(empNo);
+
+  const user = db.prepare('SELECT name, designation, company FROM users WHERE emp_no=?').get(empNo);
+  let csv = `Performance History - ${user?.name||''} (${empNo})\r\n`;
+  csv += `Company: ${user?.company||''} | Designation: ${user?.designation||''}\r\n\r\n`;
+  csv += 'Cycle,Mid-Year Score,Mid Rating,YE Score,Final Rating,Mid - What Went Well,Mid - Improve,YE - What Went Well,Supervisor Comments\r\n';
+
+  sheets.forEach(s => {
+    csv += [s.cycle, s.mid_score||'', s.mid_rating||'', s.ye_score||'', s.final_rating||s.ye_rating||'',
+      '"'+(s.mid_went_well||'').replace(/"/g,'""')+'"',
+      '"'+(s.mid_improve||'').replace(/"/g,'""')+'"',
+      '"'+(s.ye_went_well||'').replace(/"/g,'""')+'"',
+      '"'+(s.ye_mgr_comments||'').replace(/"/g,'""')+'"'
+    ].join(',')+'\r\n';
+  });
+
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition','attachment; filename="my-performance-history.csv"');
+  res.send(csv);
+});
+
+// GET /api/performance/org-summary — organisation performance summary across cycles (HR/EXCO)
+router.get('/performance/org-summary', (req, res) => {
+  if (req.user.role !== 'hr_admin' && ROLE_LEVELS[req.user.role] < ROLE_LEVELS['exco']) {
+    return res.status(403).json({error:'Access denied.'});
+  }
+  const cycles = db.prepare('SELECT DISTINCT cycle FROM goal_sheets ORDER BY cycle DESC').all();
+  const summary = cycles.map(c => {
+    const stats = db.prepare(`
+      SELECT
+        COUNT(DISTINCT u.emp_no) as total,
+        SUM(CASE WHEN gs.status='approved' THEN 1 ELSE 0 END) as goals_approved,
+        SUM(CASE WHEN r_ye.system_rating='A' THEN 1 ELSE 0 END) as rating_a,
+        SUM(CASE WHEN r_ye.system_rating='B' THEN 1 ELSE 0 END) as rating_b,
+        SUM(CASE WHEN r_ye.system_rating='C' THEN 1 ELSE 0 END) as rating_c,
+        SUM(CASE WHEN r_ye.system_rating='D' THEN 1 ELSE 0 END) as rating_d,
+        SUM(CASE WHEN r_ye.system_rating='E' THEN 1 ELSE 0 END) as rating_e,
+        AVG(r_ye.overall_score) as avg_score,
+        SUM(CASE WHEN r_ye.promo_recommended=1 THEN 1 ELSE 0 END) as promoted
+      FROM users u
+      LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+      LEFT JOIN reviews r_ye ON r_ye.sheet_id=gs.id AND r_ye.review_type='year_end'
+      WHERE u.is_active=1 AND u.role!='hr_admin'
+    `).get(c.cycle);
+    return { cycle: c.cycle, ...stats };
+  });
+  res.json(summary);
+});
+
+// ════════════════════════════════════════════════════════════
+// PHASE 2 — ADMIN STATS (used by HR Dashboard and Reports)
+// ════════════════════════════════════════════════════════════
+
+router.get('/stats', requireHR, (req, res) => {
+  const total = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1").get().n;
+  const totalNonHR = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1 AND role!='hr_admin'").get().n;
+  // Activated = user has logged in at least once (last_login IS NOT NULL)
+  const activated = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1 AND role!='hr_admin' AND last_login IS NOT NULL").get().n;
+  const goalStats = db.prepare(`
+    SELECT gs.status, COUNT(*) as n FROM goal_sheets gs
+    JOIN users u ON u.emp_no=gs.emp_no WHERE gs.cycle=? AND u.role!='hr_admin'
+    GROUP BY gs.status
+  `).all(CYCLE);
+  const midStats = db.prepare(`
+    SELECT
+      SUM(CASE WHEN r.self_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as self_submitted,
+      SUM(CASE WHEN r.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mgr_submitted
+    FROM reviews r JOIN goal_sheets gs ON gs.id=r.sheet_id
+    WHERE r.review_type='mid_year' AND gs.cycle=?
+  `).get(CYCLE);
+  const yeStats = db.prepare(`
+    SELECT
+      SUM(CASE WHEN r.self_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as self_submitted,
+      SUM(CASE WHEN r.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mgr_submitted
+    FROM reviews r JOIN goal_sheets gs ON gs.id=r.sheet_id
+    WHERE r.review_type='year_end' AND gs.cycle=?
+  `).get(CYCLE);
+  const midDist = db.prepare(`
+    SELECT r.system_rating, COUNT(*) as n FROM reviews r
+    JOIN goal_sheets gs ON gs.id=r.sheet_id
+    WHERE r.review_type='mid_year' AND gs.cycle=? AND r.system_rating IS NOT NULL
+    GROUP BY r.system_rating
+  `).all(CYCLE);
+  const yeDist = db.prepare(`
+    SELECT r.system_rating, COUNT(*) as n FROM reviews r
+    JOIN goal_sheets gs ON gs.id=r.sheet_id
+    WHERE r.review_type='year_end' AND gs.cycle=? AND r.system_rating IS NOT NULL
+    GROUP BY r.system_rating
+  `).all(CYCLE);
+  const byCompany = db.prepare(`
+    SELECT u.company, u.cluster, COUNT(*) as n,
+      SUM(CASE WHEN gs.status='approved' THEN 1 ELSE 0 END) as approved_n,
+      SUM(CASE WHEN gs.status='submitted' THEN 1 ELSE 0 END) as submitted_n,
+      SUM(CASE WHEN gs.status='draft' THEN 1 ELSE 0 END) as draft_n,
+      SUM(CASE WHEN r_mid.self_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mid_submitted_n,
+      SUM(CASE WHEN r_mid.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as mid_mgr_n,
+      SUM(CASE WHEN r_ye.self_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as ye_submitted_n,
+      SUM(CASE WHEN r_ye.mgr_submitted_at IS NOT NULL THEN 1 ELSE 0 END) as ye_mgr_n,
+      SUM(CASE WHEN u.last_login IS NOT NULL THEN 1 ELSE 0 END) as activated_n
+    FROM users u
+    LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+    LEFT JOIN reviews r_mid ON r_mid.sheet_id=gs.id AND r_mid.review_type='mid_year'
+    LEFT JOIN reviews r_ye ON r_ye.sheet_id=gs.id AND r_ye.review_type='year_end'
+    WHERE u.is_active=1
+    GROUP BY u.company ORDER BY u.cluster, u.company
+  `).all(CYCLE);
+  const pendingChanges = db.prepare("SELECT COUNT(*) as n FROM goal_change_requests WHERE cycle=? AND status='pending'").get(CYCLE).n;
+
+  res.json({
+    total_users: total,
+    total_non_hr: totalNonHR,
+    activated,
+    not_activated: totalNonHR - activated,
+    goal_stats: goalStats,
+    mid_year: midStats,
+    year_end: yeStats,
+    mid_dist: midDist,
+    ye_dist: yeDist,
+    by_company: byCompany,
+    pending_changes: pendingChanges
+  });
+});
+
+// GET /api/export/calibration-sheet — individual calibration data, optional ?company= filter
+router.get('/export/calibration-sheet', requireHR, (req, res) => {
+  const { company } = req.query;
+  let sql = `SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.cluster,
+    r.overall_score, r.system_rating, r.override_rating, r.final_rating,
+    r.precal_adjusted, sup.name as supervisor_name
+    FROM users u
+    LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+    LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
+    LEFT JOIN users sup ON sup.emp_no=u.reports_to
+    WHERE u.is_active=1 AND u.role!='hr_admin'`;
+  const params=[CYCLE];
+  if(company){sql+=' AND u.company=?';params.push(company);}
+  sql+=' ORDER BY u.company, u.name';
+  const rows=db.prepare(sql).all(...params);
+  const ratingLabel={A:'Exceptional',B:'Strong',C:'Competent',D:'Inconsistent',E:'Below Expectations'};
+  let csv='Emp No,Name,Designation,Grade,Department,Company,Cluster,Supervisor,Score,System Rating,Rating Label,Override Rating,Final Rating,Pre-Cal Adjusted\r\n';
+  rows.forEach(r=>{
+    const fr=r.final_rating||r.system_rating||'';
+    csv+=[r.emp_no,r.name,r.designation||'',r.grade||'',r.dept||'',r.company,r.cluster||'',
+      r.supervisor_name||'',r.overall_score||'',r.system_rating||'',ratingLabel[r.system_rating]||'',
+      r.override_rating||'',fr,ratingLabel[fr]||'',r.precal_adjusted?'Yes':'No'].join(',')+'\r\n';
+  });
+  const slug=company?company.replace(/[^a-z0-9]+/gi,'-').toLowerCase():'all';
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="calibration-${slug}-${CYCLE}.csv"`);
+  res.send(csv);
+});
+
+// GET /api/export/calibration-by-company — rating distribution by company
+router.get('/export/calibration-by-company', requireHR, (req, res) => {  const rows = db.prepare(`
+    SELECT u.company, u.cluster,
+      COUNT(*) as total,
+      SUM(CASE WHEN (r.final_rating='A' OR (r.final_rating IS NULL AND r.system_rating='A')) THEN 1 ELSE 0 END) as a_count,
+      SUM(CASE WHEN (r.final_rating='B' OR (r.final_rating IS NULL AND r.system_rating='B')) THEN 1 ELSE 0 END) as b_count,
+      SUM(CASE WHEN (r.final_rating='C' OR (r.final_rating IS NULL AND r.system_rating='C')) THEN 1 ELSE 0 END) as c_count,
+      SUM(CASE WHEN (r.final_rating='D' OR (r.final_rating IS NULL AND r.system_rating='D')) THEN 1 ELSE 0 END) as d_count,
+      SUM(CASE WHEN (r.final_rating='E' OR (r.final_rating IS NULL AND r.system_rating='E')) THEN 1 ELSE 0 END) as e_count,
+      AVG(r.overall_score) as avg_score
+    FROM users u
+    LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+    LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
+    WHERE u.is_active=1 AND u.role!='hr_admin'
+    GROUP BY u.company ORDER BY u.cluster, u.company
+  `).all(CYCLE);
+
+  let csv = 'Company,Cluster,Total,A (Exceptional),B (Strong),C (Competent),D (Inconsistent),E (Below Exp),A+B,A+B%,Avg Score\r\n';
+  let totals = {total:0,a:0,b:0,c:0,d:0,e:0};
+  rows.forEach(r => {
+    const ab = (r.a_count||0)+(r.b_count||0);
+    const abPct = r.total>0 ? Math.round(ab/r.total*100) : 0;
+    csv += [r.company, r.cluster||'', r.total, r.a_count||0, r.b_count||0, r.c_count||0,
+      r.d_count||0, r.e_count||0, ab, abPct+'%',
+      r.avg_score!=null ? Math.round(r.avg_score*10)/10 : ''].join(',')+'\r\n';
+    totals.total+=r.total; totals.a+=(r.a_count||0); totals.b+=(r.b_count||0);
+    totals.c+=(r.c_count||0); totals.d+=(r.d_count||0); totals.e+=(r.e_count||0);
+  });
+  const totAB=totals.a+totals.b;
+  csv += ['All Companies','',totals.total,totals.a,totals.b,totals.c,totals.d,totals.e,
+    totAB, totals.total>0?Math.round(totAB/totals.total*100)+'%':'0%',''].join(',')+'\r\n';
+
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="calibration-by-company-${CYCLE}.csv"`);
+  res.send(csv);
+});
+
+// Export for year-end summary (already in export routes but adding here for completeness)
+router.get('/export/promotions', requireHR, (req, res) => {
+  const rows = db.prepare(`
+    SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company, u.cluster,
+           r.overall_score, r.system_rating, r.final_rating,
+           r.promo_justification, r.mgr_strengths,
+           r.promo_status, r.promo_decision_reason,
+           sup.name as supervisor_name, dec.name as decided_by_name
+    FROM users u
+    JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+    JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end' AND r.promo_recommended=1
+    LEFT JOIN users sup ON sup.emp_no=u.reports_to
+    LEFT JOIN users dec ON dec.emp_no=r.promo_decision_by
+    ORDER BY u.company, r.overall_score DESC
+  `).all(CYCLE);
+  let csv = 'Emp No,Name,Designation,Grade,Department,Company,Cluster,Score,Rating,Final Rating,Supervisor,Justification,Strengths,HR Decision,Decision Reason,Decided By\r\n';
+  rows.forEach(r => {
+    csv += [r.emp_no, r.name, r.designation||'', r.grade||'', r.dept||'',
+      r.company, r.cluster||'', r.overall_score||'', r.system_rating||'', r.final_rating||'',
+      r.supervisor_name||'',
+      '"'+(r.promo_justification||'').replace(/"/g,'""')+'"',
+      '"'+(r.mgr_strengths||'').replace(/"/g,'""')+'"',
+      r.promo_status||'pending',
+      '"'+(r.promo_decision_reason||'').replace(/"/g,'""')+'"',
+      r.decided_by_name||''].join(',')+'\r\n';
+  });
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="promotions-${CYCLE}.csv"`);
+  res.send(csv);
+});
+
+// GET /api/company-drilldown/:company — employee detail for reports drill-down modal
+router.get('/company-drilldown/:company', requireHR, (req, res) => {
+  const company = decodeURIComponent(req.params.company);
+  const rows = db.prepare(`
+    SELECT u.emp_no, u.name, u.designation, u.grade, u.dept, u.company,
+           u.role, m.name as manager_name,
+           gs.status as goal_status,
+           gs.submitted_at, gs.approved_at,
+           r_mid.self_submitted_at as mid_submitted,
+           r_mid.mgr_submitted_at as mid_mgr_submitted,
+           r_mid.overall_score as mid_score, r_mid.system_rating as mid_rating,
+           r_ye.self_submitted_at as ye_submitted,
+           r_ye.mgr_submitted_at as ye_mgr_submitted,
+           r_ye.overall_score as ye_score, r_ye.system_rating as ye_rating,
+           r_ye.final_rating
+    FROM users u
+    LEFT JOIN users m ON m.emp_no = u.reports_to
+    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no AND gs.cycle = ?
+    LEFT JOIN reviews r_mid ON r_mid.sheet_id = gs.id AND r_mid.review_type = 'mid_year'
+    LEFT JOIN reviews r_ye ON r_ye.sheet_id = gs.id AND r_ye.review_type = 'year_end'
+    WHERE u.is_active = 1 AND u.company = ?
+    ORDER BY u.name
+  `).all(CYCLE, company);
+  res.json(rows);
+});
+
+
+// ════════════════════════════════════════════════════════════
+
+// GET /api/analytics/ratings-by-cycle — all cycles ratings (HR only)
+router.get('/analytics/ratings-by-cycle', requireHR, (req, res) => {
+  const cycles = db.prepare('SELECT DISTINCT cycle FROM goal_sheets ORDER BY cycle ASC').all();
+  const result = cycles.map(c => {
+    const emps = db.prepare(`
+      SELECT u.emp_no, u.name, u.designation, u.company, u.cluster, u.grade,
+             r.overall_score as ye_score, r.system_rating as ye_rating, r.final_rating,
+             r_mid.overall_score as mid_score, r_mid.system_rating as mid_rating
+      FROM users u
+      LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+      LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
+      LEFT JOIN reviews r_mid ON r_mid.sheet_id=gs.id AND r_mid.review_type='mid_year'
+      WHERE u.is_active=1
+      ORDER BY u.company, u.name
+    `).all(c.cycle);
+    const dist={A:0,B:0,C:0,D:0,E:0};
+    emps.forEach(e=>{const r=e.final_rating||e.ye_rating;if(r&&dist[r]!==undefined)dist[r]++;});
+    return {cycle:c.cycle, employees:emps, distribution:dist};
+  });
+  res.json(result);
+});
+
+// GET /api/export/analytics-ratings — year-wise ratings CSV
+router.get('/export/analytics-ratings', requireHR, (req, res) => {
+  const cycles = db.prepare('SELECT DISTINCT cycle FROM goal_sheets ORDER BY cycle ASC').all();
+  let csv = 'Emp No,Name,Designation,Company,Cluster,Grade';
+  cycles.forEach(c=>{csv+=','+c.cycle+' Mid Score,'+c.cycle+' Mid Rating,'+c.cycle+' YE Score,'+c.cycle+' Final Rating';});
+  csv+='\r\n';
+  const emps = db.prepare("SELECT emp_no,name,designation,company,cluster,grade FROM users WHERE is_active=1 ORDER BY company,name").all();
+  emps.forEach(u=>{
+    let row=[u.emp_no,u.name,u.designation||'',u.company,u.cluster||'',u.grade||''];
+    cycles.forEach(c=>{
+      const r=db.prepare(`SELECT r.overall_score as ye_score,r.system_rating as ye_rating,r.final_rating,r_mid.overall_score as mid_score,r_mid.system_rating as mid_rating FROM goal_sheets gs LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end' LEFT JOIN reviews r_mid ON r_mid.sheet_id=gs.id AND r_mid.review_type='mid_year' WHERE gs.emp_no=? AND gs.cycle=?`).get(u.emp_no,c.cycle);
+      if(r){row.push(r.mid_score||'',r.mid_rating||'',r.ye_score||'',r.final_rating||r.ye_rating||'');}
+      else{row.push('','','','');}
+    });
+    csv+=row.join(',')+'\r\n';
+  });
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition','attachment; filename="ratings-by-year.csv"');
+  res.send(csv);
+});
+
+// GET /api/export/analytics-competency — competency ratings CSV
+router.get('/export/analytics-competency', requireHR, (req, res) => {
+  let csv='Emp No,Name,Company,Cycle,C1 Self,C1 Mgr,C2 Self,C2 Mgr,C3 Self,C3 Mgr,C4 Self,C4 Mgr,C5 Self,C5 Mgr,C6 Self,C6 Mgr\r\n';
+  let rows;
+  try {
+    rows = db.prepare(`SELECT u.emp_no,u.name,u.company,gs.cycle,cr.c1_self,cr.c1_mgr,cr.c2_self,cr.c2_mgr,cr.c3_self,cr.c3_mgr,cr.c4_self,cr.c4_mgr,cr.c5_self,cr.c5_mgr,cr.c6_self,cr.c6_mgr FROM users u JOIN goal_sheets gs ON gs.emp_no=u.emp_no LEFT JOIN competency_ratings cr ON cr.sheet_id=gs.id WHERE u.is_active=1 ORDER BY u.company,u.name,gs.cycle`).all();
+  } catch(e) { rows=[]; }
+  rows.forEach(r=>{
+    csv+=[r.emp_no,r.name,r.company,r.cycle,r.c1_self||'',r.c1_mgr||'',r.c2_self||'',r.c2_mgr||'',r.c3_self||'',r.c3_mgr||'',r.c4_self||'',r.c4_mgr||'',r.c5_self||'',r.c5_mgr||'',r.c6_self||'',r.c6_mgr||''].join(',')+'\r\n';
+  });
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition','attachment; filename="competency-ratings.csv"');
+  res.send(csv);
+});
+
+// GET /api/reviews/:empNo/precal-history
+router.get('/reviews/:empNo/precal-history', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  if (!canAccessEmployee(req.user, empNo)) return res.status(403).json({error:'Access denied.'});
+  const sheet = db.prepare('SELECT id FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) return res.json([]);
+  try {
+    const history = db.prepare(`
+      SELECT pca.*, u.name as adjusted_by_name
+      FROM precal_adjustments pca
+      LEFT JOIN users u ON u.emp_no = pca.adjusted_by
+      WHERE pca.sheet_id = ?
+      ORDER BY pca.adjusted_at DESC
+    `).all(sheet.id);
+    res.json(history);
+  } catch(e) {
+    res.json([]); // table may not exist yet
+  }
+});
+
+// POST /api/reviews/:empNo/precal-adjust — supervisor saves pre-calibration adjustment
+router.post('/reviews/:empNo/precal-adjust', (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const emp = db.prepare('SELECT reports_to FROM users WHERE emp_no=?').get(empNo);
+  if (req.user.role !== 'hr_admin' && emp?.reports_to !== req.user.emp_no) {
+    return res.status(403).json({error:'Only the direct supervisor or HR can adjust ratings.'});
+  }
+  const { kpis, reason } = req.body;
+  if (!reason || !reason.trim()) return res.status(400).json({error:'A reason is required for pre-calibration adjustments.'});
+  const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) return res.status(404).json({error:'No goal sheet found.'});
+
+  // Check calibration not locked
+  const cycleSettings = db.prepare('SELECT calib_locked FROM cycle_settings WHERE cycle=?').get(CYCLE);
+  if (cycleSettings?.calib_locked) return res.status(400).json({error:'Calibration has been locked by HR. No further adjustments allowed.'});
+
+  const now = Math.floor(Date.now()/1000);
+
+  // Update KPI manager ratings
+  try {
+    (kpis||[]).forEach(k => {
+      db.prepare('UPDATE kpis SET mgr_end_ach=?, updated_at=? WHERE id=?')
+        .run(k.mgr_end_ach, now, k.id);
+    });
+  } catch(e) {
+    console.error('Pre-cal KPI update error:', e);
+    return res.status(500).json({error:'Failed to update KPI ratings: ' + e.message});
+  }
+
+  // Recompute scores
+  const scores = computeScores(sheet.id, 'end');
+
+  // Update review record
+  const existing = db.prepare("SELECT id FROM reviews WHERE sheet_id=? AND review_type='year_end'").get(sheet.id);
+  if (existing) {
+    db.prepare("UPDATE reviews SET overall_score=?, system_rating=?, precal_adjusted=1, updated_at=? WHERE id=?")
+      .run(scores.overall, scores.rating, now, existing.id);
+  }
+
+  // Log the adjustment in precal_adjustments table
+  try {
+    db.prepare(`INSERT INTO precal_adjustments(sheet_id,emp_no,adjusted_by,reason,kpis_snapshot,adjusted_at) VALUES(?,?,?,?,?,?)`)
+      .run(sheet.id, empNo, req.user.emp_no, reason.trim(), JSON.stringify(kpis), now);
+  } catch(e) {
+    // Table may not exist — log to audit only
+  }
+
+  db.logAudit(req.user.id, 'precal_adjustment', 'review', sheet.id, {empNo, reason: reason.trim()}, req.ip);
+  res.json({success:true, scores});
+});
+
+module.exports = router;
