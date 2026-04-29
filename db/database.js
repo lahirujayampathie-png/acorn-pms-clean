@@ -314,7 +314,22 @@ async function migrate() {
     CREATE INDEX IF NOT EXISTS idx_gcr_sheet ON goal_change_requests(sheet_id);
     CREATE INDEX IF NOT EXISTS idx_gcr_emp ON goal_change_requests(emp_no);
 
-    -- Pre-Calibration Adjustments log
+    -- Notifications (in-app alerts + email log)
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      emp_no INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT,
+      link TEXT,
+      is_read INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_emp ON notifications(emp_no);
+    CREATE INDEX IF NOT EXISTS idx_notif_read ON notifications(emp_no, is_read);
+
+    -- Users email field
+    ALTER TABLE users ADD COLUMN email TEXT
     CREATE TABLE IF NOT EXISTS precal_adjustments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sheet_id INTEGER NOT NULL,

@@ -274,6 +274,17 @@ textarea.fi{resize:vertical;min-height:65px}select.fi{cursor:pointer}
     <div id="topbar">
       <div id="page-title">Dashboard</div>
       <div class="cycle-pill" id="cycle-pill">FY 2026&#8211;27 Active</div>
+      <div id="notif-bell" style="position:relative;cursor:pointer;margin-left:8px" onclick="toggleNotifPanel()" title="Notifications">
+        <span style="font-size:18px">&#x1F514;</span>
+        <span id="notif-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:var(--red);color:#fff;font-size:9px;font-weight:700;border-radius:10px;padding:1px 5px;min-width:16px;text-align:center">0</span>
+      </div>
+    </div>
+    <div id="notif-panel" style="display:none;position:fixed;top:52px;right:12px;width:360px;max-height:480px;background:#fff;border-radius:var(--r-lg);box-shadow:var(--sh-lg);border:1px solid var(--g200);z-index:200;overflow:hidden">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--g100);display:flex;align-items:center;justify-content:space-between">
+        <div style="font-size:13px;font-weight:700">Notifications</div>
+        <button class="btn btn-sm" onclick="markAllNotifsRead()" style="font-size:10px">Mark all read</button>
+      </div>
+      <div id="notif-list" style="overflow-y:auto;max-height:400px;padding:8px 0"></div>
     </div>
     <div id="content"><div class="empty">Loading&#8230;</div></div>
   </main>
@@ -284,7 +295,7 @@ textarea.fi{resize:vertical;min-height:65px}select.fi{cursor:pointer}
 // ── STATE ────────────────────────────────────────────────────
 var G={user:null,page:'dashboard',team:null,cycle:null,supData:null,
        goalCache:{},calibLocked:true,umData:null,calibData:null,empData:null,
-       compRatings:{},mgrCompRatings:{}};
+       compRatings:{},mgrCompRatings:{},promoData:null,historyEmpNo:null,historyEmpName:null};
 var RL={employee:1,supervisor:2,manager:3,senior_manager:4,sbu_head:5,exco:6,hr_admin:7};
 var RLB={employee:'Employee',supervisor:'Supervisor',manager:'Manager',
   senior_manager:'Senior Mgr',sbu_head:'SBU Head',exco:'ExCo',hr_admin:'HR Admin'};
@@ -367,11 +378,90 @@ window.onload=function(){
     xhr('GET','/api/cycle',null,function(ec,cycle){
       G.cycle=cycle||{goal_setting_open:1,mid_year_open:0,year_end_open:0};
       updateCyclePill(); go('dashboard');
+      // Start notification polling every 60 seconds
+      loadNotifications();
+      setInterval(loadNotifications, 60000);
     });
   });
 };
 
-// ── HELPERS ───────────────────────────────────────────────────
+// ── NOTIFICATIONS ─────────────────────────────────────────────
+function loadNotifications(){
+  xhr('GET','/api/notifications',null,function(err,notifs){
+    if(err)return;
+    var unread=(notifs||[]).filter(function(n){return!n.is_read;}).length;
+    var badge=sel('notif-badge');
+    if(badge){
+      badge.style.display=unread>0?'block':'none';
+      badge.textContent=unread>9?'9+':String(unread);
+    }
+    renderNotifList(notifs||[]);
+  });
+}
+
+function renderNotifList(notifs){
+  var list=sel('notif-list');
+  if(!list)return;
+  if(!notifs.length){
+    list.innerHTML='<div class="empty" style="padding:30px;font-size:12px">\u2714 All caught up \u2014 no notifications</div>';
+    return;
+  }
+  var h='';
+  notifs.slice(0,30).forEach(function(n){
+    var age=Math.floor((Date.now()/1000-n.created_at)/3600);
+    var ageStr=age<1?'Just now':age<24?age+'h ago':Math.floor(age/24)+'d ago';
+    h+='<div style="padding:10px 16px;border-bottom:1px solid var(--g100);cursor:pointer;background:'+(n.is_read?'#fff':'#EFF6FF')+'"'+
+      (n.link?' onclick="go(\'myReviews\');markNotifRead('+n.id+')"':' onclick="markNotifRead('+n.id+')"')+'>'+
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">'+
+      '<div style="flex:1">'+
+      '<div style="font-size:11px;font-weight:'+(n.is_read?'400':'700')+';color:var(--g900)">'+esc(n.title)+'</div>'+
+      '<div style="font-size:10px;color:var(--g500);margin-top:2px">'+esc(n.message||'')+'</div>'+
+      '</div>'+
+      '<div style="font-size:9px;color:var(--g400);flex-shrink:0">'+ageStr+'</div></div></div>';
+  });
+  list.innerHTML=h;
+}
+
+function toggleNotifPanel(){
+  var panel=sel('notif-panel');
+  if(!panel)return;
+  if(panel.style.display==='none'){
+    panel.style.display='block';
+    loadNotifications();
+    // Close on outside click
+    setTimeout(function(){
+      document.addEventListener('click',closeNotifOnOutside,{once:true});
+    },10);
+  } else {
+    panel.style.display='none';
+  }
+}
+
+function closeNotifOnOutside(e){
+  var panel=sel('notif-panel');
+  var bell=sel('notif-bell');
+  if(panel&&bell&&!panel.contains(e.target)&&!bell.contains(e.target)){
+    panel.style.display='none';
+  }
+}
+
+function markNotifRead(id){
+  xhr('PUT','/api/notifications/'+id+'/read',null,function(){loadNotifications();});
+}
+
+function markAllNotifsRead(){
+  xhr('PUT','/api/notifications/read',null,function(){loadNotifications();toast('All notifications marked as read','ok');});
+}
+
+// HR: trigger notification manually
+function triggerNotification(type,target,label){
+  xhr('POST','/api/notifications/trigger',{type:type,target:target},function(err,res){
+    if(err){toast(err,'error');return;}
+    toast('\u2713 Notification sent to '+res.sent+' recipient'+(res.sent!==1?'s':'')+': '+label,'ok');
+  });
+}
+
+
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function initials(n){return String(n||'').split(' ').slice(0,2).map(function(w){return w[0]||'';}).join('').toUpperCase();}
 var AVC=[['#DBEAFE','#1E3A8A'],['#DCFCE7','#14532D'],['#EDE9FE','#4C1D95'],
@@ -2872,8 +2962,79 @@ function pgHRDash(){
         '<div class="cycle-toggle-row" style="border-bottom:none"><span style="font-size:12px;color:var(--g600)">Manage users, roles, passwords</span>'+
         '<button class="btn btn-sm" id="btn-go-um">User Management</button></div></div></div>';
 
+      // Notification Center
+      h+='<div class="card" style="margin-top:14px">'+
+        '<div class="card-title">\ud83d\udd14 Notification Center '+
+        '<span class="card-sub">Send system notifications to employees</span></div>'+
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'+
+
+        // Left — quick triggers
+        '<div>'+
+        '<div style="font-size:10px;font-weight:700;color:var(--g500);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Quick Triggers</div>'+
+        '<div style="display:flex;flex-direction:column;gap:6px">'+
+        '<div style="font-size:11px;font-weight:600;color:var(--g600);margin-top:4px">\ud83c\udfaf Goal Setting</div>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'goal_setting_opened\',\'all\',\'Goal Setting Opened \u2014 All\')">\ud83d\udce7 Phase Opened \u2014 All Employees</button>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'deadline_reminder\',\'pending_goals\',\'Goal Setting Reminder\')">\u23f0 Deadline Reminder \u2014 Not Started</button>'+
+
+        '<div style="font-size:11px;font-weight:600;color:var(--g600);margin-top:8px">\ud83d\uddd2 Mid-Year Review</div>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'midyear_opened\',\'all\',\'Mid-Year Opened \u2014 All\')">\ud83d\udce7 Phase Opened \u2014 All Employees</button>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'deadline_reminder\',\'pending_mid\',\'Mid-Year Reminder\')">\u23f0 Deadline Reminder \u2014 Not Submitted</button>'+
+
+        '<div style="font-size:11px;font-weight:600;color:var(--g600);margin-top:8px">\ud83c\udfc6 Year-End Review</div>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'yearend_opened\',\'all\',\'Year-End Opened \u2014 All\')">\ud83d\udce7 Phase Opened \u2014 All Employees</button>'+
+        '<button class="btn btn-sm" onclick="triggerNotification(\'deadline_reminder\',\'pending_ye\',\'Year-End Reminder\')">\u23f0 Deadline Reminder \u2014 Not Submitted</button>'+
+        '<button class="btn btn-sm btn-blue" onclick="triggerNotification(\'final_rating_published\',\'all\',\'Final Ratings Published\')">\u2b50 Final Ratings Published \u2014 All</button>'+
+        '</div></div>'+
+
+        // Right — custom notification
+        '<div>'+
+        '<div style="font-size:10px;font-weight:700;color:var(--g500);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Custom Notification</div>'+
+        '<div class="fg"><label class="fl">Send to</label>'+
+        '<select class="fi" id="cn-target">'+
+        '<option value="all">All Employees (284)</option>'+
+        '<option value="pending_goals">Employees with pending goals</option>'+
+        '<option value="pending_mid">Mid-year not submitted</option>'+
+        '<option value="pending_ye">Year-end not submitted</option>'+
+        '<optgroup label="By Company">'+
+        (s.by_company||[]).map(function(co){
+          return'<option value="co:'+esc(co.company)+'">'+esc((co.company||'').replace(' (Private) Limited','').replace(' (Pvt) Ltd',''))+' ('+co.n+')</option>';
+        }).join('')+
+        '</optgroup></select></div>'+
+        '<div class="fg"><label class="fl">Notification Type</label>'+
+        '<select class="fi" id="cn-type">'+
+        '<option value="goal_setting_opened">Goal Setting Opened</option>'+
+        '<option value="midyear_opened">Mid-Year Review Opened</option>'+
+        '<option value="yearend_opened">Year-End Review Opened</option>'+
+        '<option value="deadline_reminder">Deadline Reminder</option>'+
+        '<option value="final_rating_published">Final Ratings Published</option>'+
+        '<option value="goal_approved">Goals Approved</option>'+
+        '</select></div>'+
+        '<button class="btn btn-blue btn-sm" style="width:100%;margin-top:4px" id="cn-send-btn">\ud83d\udce7 Send Notification</button>'+
+        '<div style="font-size:10px;color:var(--g400);margin-top:6px" id="cn-status"></div>'+
+        '</div></div></div>';
+
       setContent(h);
       wirePhaseCards();
+
+      var cnBtn=sel('cn-send-btn');
+      if(cnBtn)cnBtn.onclick=function(){
+        var target=(sel('cn-target')||{}).value||'all';
+        var type=(sel('cn-type')||{}).value||'deadline_reminder';
+        var statusEl=sel('cn-status');
+        cnBtn.disabled=true;cnBtn.textContent='Sending\u2026';
+        if(statusEl)statusEl.textContent='';
+        // Handle company target
+        var apiTarget=target;
+        if(target.startsWith('co:')){apiTarget=target.slice(3);}
+        xhr('POST','/api/notifications/trigger',{type:type,target:apiTarget},function(err,res){
+          cnBtn.disabled=false;cnBtn.textContent='\ud83d\udce7 Send Notification';
+          if(err){toast(err,'error');if(statusEl)statusEl.textContent='\u2717 Error: '+err;return;}
+          var msg='\u2713 Sent to '+res.sent+' recipient'+(res.sent!==1?'s':'')+
+            (res.message?' \u2014 '+res.message:'');
+          toast(msg,'ok');
+          if(statusEl){statusEl.style.color='var(--green)';statusEl.textContent=msg;}
+        });
+      };
 
       var pc=sel('btn-pub-calib');if(pc)pc.onclick=function(){G.calibLocked=!G.calibLocked;xhr('POST','/api/calibration/publish',{published:!G.calibLocked},function(){});toast(G.calibLocked?'Ratings locked \ud83d\udd12':'Ratings published \ud83d\udd13',G.calibLocked?'info':'ok');pgHRDash();};
       var gc=sel('btn-go-calib');if(gc)gc.onclick=function(){go('calibration');};
@@ -2891,6 +3052,13 @@ function pgHRDash(){
 function pgUserMgmt(){
   xhr('GET','/admin/users?limit=500',null,function(err,users){
     if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
+    // Also fetch full user data (includes email) and merge
+    xhr('GET','/api/employees',null,function(e2,fullUsers){
+      if(fullUsers&&fullUsers.length){
+        var emailMap={};
+        fullUsers.forEach(function(u){if(u.email)emailMap[u.emp_no]=u.email;});
+        users.forEach(function(u){if(emailMap[u.emp_no])u.email=emailMap[u.emp_no];});
+      }
     G.umData=users;
     var cos=[...new Set(users.map(function(u){return u.company;}))].sort();
     var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'+
@@ -2906,7 +3074,8 @@ function pgUserMgmt(){
     sel('btn-add-user').onclick=openAddUserModal;
     sel('um-q').oninput=filterUM; sel('um-co').onchange=filterUM; sel('um-st').onchange=filterUM;
     wireUMTable(users);
-  });
+    }); // close api/employees xhr
+  }); // close admin/users xhr
 }
 function filterUM(){
   if(!G.umData)return;
@@ -2931,7 +3100,9 @@ function buildUMTable(list){
     var sTxt=!u.is_active?'\ud83d\udeab Inactive':locked?'\ud83d\udd12 Locked':!u.activated?'\u26a0 Not Activated':u.must_change_pw?'\u26a1 Must Change PW':'\u2713 Active';
     var sCol=!u.is_active||locked?'var(--red)':!u.activated?'var(--amber)':'var(--green)';
     h+='<tr><td><div class="nc">'+avEl(u,'sm')+'<div><div class="en">'+esc(u.name)+'</div>'+
-      '<div class="es">'+esc(u.designation||'')+' \u00b7 Emp '+u.emp_no+'</div></div></div></td>'+
+      '<div class="es">'+esc(u.designation||'')+' \u00b7 Emp '+u.emp_no+'</div>'+
+      (u.email?'<div style="font-size:9px;color:var(--blue)">\u2709 '+esc(u.email)+'</div>':'<div style="font-size:9px;color:var(--amber)">\u26a0 No email</div>')+
+      '</div></div></td>'+
       '<td style="font-size:10px;color:var(--g400)">'+esc((u.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited',''))+'</td>'+
       '<td><select class="fi" id="um-role-'+i+'" style="padding:3px 6px;font-size:10px;width:110px">'+
       Object.entries(RLB).map(function(kv){return'<option value="'+kv[0]+'"'+(u.role===kv[0]?' selected':'')+'>'+kv[1]+'</option>';}).join('')+'</select></td>'+
@@ -4732,8 +4903,14 @@ function openAddUserModal(){
 }
 
 function openEditModal(empNo){
-  xhr('GET','/admin/users/'+empNo,null,function(err,u){
-    if(err){toast(err,'error');return;}
+  // Try api route first (has email field), fallback to admin route
+  xhr('GET','/api/users/'+empNo,null,function(err,u){
+    if(err||!u){xhr('GET','/admin/users/'+empNo,null,function(e2,u2){if(e2){toast(e2,'error');return;}renderEditModal(empNo,u2||{emp_no:empNo});});return;}
+    renderEditModal(empNo,u);
+  });
+}
+function renderEditModal(empNo,u){
+    if(!u){toast('User not found','error');return;}
     var coOpts=COS.map(function(c){return'<option'+(u.company===c?' selected':'')+'>'+esc(c)+'</option>';}).join('');
     var gradeOpts=GRADES.map(function(g){return'<option'+(u.grade===g?' selected':'')+'>'+esc(g)+'</option>';}).join('');
     var roleOpts=Object.entries(RLB).map(function(kv){return'<option value="'+kv[0]+'"'+(u.role===kv[0]?' selected':'')+'>'+kv[1]+'</option>';}).join('');
@@ -4750,6 +4927,9 @@ function openEditModal(empNo){
       '<div class="fr2">'+
       '<div class="fg"><label class="fl">Company</label><select class="fi" id="eu-co">'+coOpts+'</select></div>'+
       '<div class="fg"><label class="fl">Department</label><input class="fi" id="eu-dept" value="'+esc(u.dept||'')+'"></div></div>'+
+      '<div class="fg"><label class="fl">Work Email Address '+
+      '<span style="font-size:10px;color:var(--g400);font-weight:400">Used for system notifications</span></label>'+
+      '<input class="fi" type="email" id="eu-email" value="'+esc(u.email||'')+'" placeholder="firstname.lastname@acorngroup.com"></div>'+
       '<div class="fg"><label class="fl">Reports To (Manager Emp No)</label>'+
       '<input class="fi" type="number" id="eu-rep" value="'+(u.reports_to||'')+'" placeholder="Manager\'s emp no">'+
       '<div style="font-size:10px;color:var(--g400);margin-top:3px">Current manager: '+esc(u.manager_name||'None')+'</div></div>'+
@@ -4757,6 +4937,13 @@ function openEditModal(empNo){
     document.body.appendChild(m);
     sel('eu-x').onclick=sel('eu-cls').onclick=function(){m.remove();};
     sel('eu-save').onclick=function(){
+      var emailVal=(sel('eu-email').value||'').trim();
+      // Basic email validation if provided
+      if(emailVal&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)){
+        toast('Please enter a valid email address','error');
+        sel('eu-email').style.borderColor='var(--red)';
+        return;
+      }
       xhr('PUT','/admin/users/'+empNo,{
         name:sel('eu-name').value.trim(),
         designation:sel('eu-desig').value.trim(),
@@ -4766,12 +4953,14 @@ function openEditModal(empNo){
         reports_to:sel('eu-rep').value||null
       },function(err2){
         if(err2){toast(err2,'error');return;}
-        xhr('PUT','/admin/users/'+empNo+'/role',{role:sel('eu-role').value},function(){
-          m.remove();toast('Updated \u2713','ok');G.umData=null;pgUserMgmt();
+        // Save email via api route (separate from admin route)
+        xhr('PUT','/api/users/'+empNo+'/email',{email:emailVal||null},function(){
+          xhr('PUT','/admin/users/'+empNo+'/role',{role:sel('eu-role').value},function(){
+            m.remove();toast('Updated \u2713','ok');G.umData=null;pgUserMgmt();
+          });
         });
       });
     };
-  });
 }
 
 function openChangePwModal(){

@@ -14,6 +14,8 @@ const {
 const router = express.Router();
 router.use(verifyToken);   // All API routes require auth
 
+const { notify, saveNotification } = require('../notifications');
+
 const CYCLE = '2026-27';
 
 const RATING_SCALE = [
@@ -37,7 +39,7 @@ router.get('/employees', (req, res) => {
     // Full visibility
     sql = `SELECT u.emp_no, u.name, u.designation, u.grade, u.dept,
                   u.company, u.division, u.cluster, u.role, u.reports_to,
-                  u.is_active, m.name as manager_name,
+                  u.is_active, u.email, m.name as manager_name,
                   gs.status as goal_status
            FROM users u
            LEFT JOIN users m ON u.reports_to = m.emp_no
@@ -277,6 +279,9 @@ router.post('/goals/:empNo/approve', (req, res) => {
 
   db.logAudit(u.id, 'goals_approved', 'goal_sheet', sheet.id,
     { emp_no: targetEmpNo, by: u.emp_no }, req.ip);
+  // Notify employee their goals were approved
+  const empUser = db.prepare('SELECT emp_no, email, name FROM users WHERE emp_no=?').get(targetEmpNo);
+  if (empUser) notify(db, 'goal_approved', [empUser], {}).catch(()=>{});
   res.json({ success: true });
 });
 
@@ -300,6 +305,8 @@ router.post('/goals/:empNo/reject', (req, res) => {
 
   db.logAudit(u.id, 'goals_rejected', 'goal_sheet', sheet.id,
     { emp_no: targetEmpNo, reason: comments }, req.ip);
+  const empUserR = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(targetEmpNo);
+  if (empUserR) notify(db, 'goal_rejected', [empUserR], {comments}).catch(()=>{});
   res.json({ success: true });
 });
 
@@ -1737,6 +1744,117 @@ router.post('/reviews/:empNo/precal-adjust', (req, res) => {
 
   db.logAudit(req.user.id, 'precal_adjustment', 'review', sheet.id, {empNo, reason: reason.trim()}, req.ip);
   res.json({success:true, scores});
+});
+
+// PUT /api/users/:empNo/email — update employee email (HR only)
+router.put('/users/:empNo/email', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const { email } = req.body;
+  try {
+    db.prepare('UPDATE users SET email=?, updated_at=? WHERE emp_no=?')
+      .run(email||null, Math.floor(Date.now()/1000), empNo);
+    res.json({success:true});
+  } catch(e) {
+    res.status(500).json({error:'Could not update email: '+e.message});
+  }
+});
+
+// GET /api/users/:empNo — get single user details including email
+router.get('/users/:empNo', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  try {
+    const u = db.prepare(`SELECT u.*, m.name as manager_name 
+      FROM users u LEFT JOIN users m ON m.emp_no=u.reports_to 
+      WHERE u.emp_no=?`).get(empNo);
+    if (!u) return res.status(404).json({error:'User not found'});
+    res.json(u);
+  } catch(e) {
+    res.status(500).json({error:e.message});
+  }
+});
+
+
+// ════════════════════════════════════════════════════════════
+
+// GET /api/notifications — get current user's unread notifications
+router.get('/notifications', (req, res) => {
+  try {
+    const notifs = db.prepare(`
+      SELECT * FROM notifications
+      WHERE emp_no=? ORDER BY created_at DESC LIMIT 50
+    `).all(req.user.emp_no);
+    res.json(notifs);
+  } catch(e) { res.json([]); }
+});
+
+// PUT /api/notifications/read — mark all as read
+router.put('/notifications/read', (req, res) => {
+  try {
+    db.prepare('UPDATE notifications SET is_read=1 WHERE emp_no=?').run(req.user.emp_no);
+  } catch(e) {}
+  res.json({success:true});
+});
+
+// PUT /api/notifications/:id/read — mark one as read
+router.put('/notifications/:id/read', (req, res) => {
+  try {
+    db.prepare('UPDATE notifications SET is_read=1 WHERE id=? AND emp_no=?')
+      .run(parseInt(req.params.id), req.user.emp_no);
+  } catch(e) {}
+  res.json({success:true});
+});
+
+// POST /api/notifications/trigger — HR manually triggers a notification
+router.post('/notifications/trigger', requireHR, async (req, res) => {
+  const { type, target } = req.body; // target: 'all' | 'pending_goals' | 'pending_mid' | 'pending_ye' | empNo
+  const CYCLE_LOCAL = CYCLE;
+  let recipients = [];
+
+  try {
+    if (target === 'all') {
+      recipients = db.prepare("SELECT emp_no, email, name FROM users WHERE is_active=1 AND role!='hr_admin'").all();
+    } else if (target === 'pending_goals') {
+      recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+        LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+        WHERE u.is_active=1 AND u.role!='hr_admin'
+        AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE_LOCAL);
+    } else if (target === 'pending_mid') {
+      recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+        JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
+        LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='mid_year'
+        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE_LOCAL);
+    } else if (target === 'pending_ye') {
+      recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+        JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
+        LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
+        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE_LOCAL);
+    } else if (target && target.length > 3) {
+      // Company name or individual emp no
+      const empNoInt = parseInt(target);
+      if (!isNaN(empNoInt) && String(empNoInt) === String(target)) {
+        const u = db.prepare('SELECT emp_no, email, name FROM users WHERE emp_no=?').get(empNoInt);
+        if (u) recipients = [u];
+      } else {
+        // Company name
+        recipients = db.prepare("SELECT emp_no, email, name FROM users WHERE is_active=1 AND company=? AND role!='hr_admin'").all(target);
+      }
+    }
+
+    if (!recipients.length) return res.json({success:true, sent:0, message:'No matching recipients.'});
+
+    const cycleSettings = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get(CYCLE_LOCAL);
+    const data = {
+      deadline: cycleSettings ? (type.includes('mid') ? cycleSettings.mid_end : type.includes('ye') || type.includes('yearend') ? cycleSettings.ye_end : cycleSettings.gs_end) : null,
+      days_left: 0,
+      phase_name: type.includes('mid') ? 'Mid-Year Review' : type.includes('ye') || type.includes('yearend') ? 'Year-End Review' : 'Goal Setting'
+    };
+
+    const { notify: notifyFn } = require('../notifications');
+    await notifyFn(db, type, recipients, data);
+    res.json({success:true, sent:recipients.length});
+  } catch(e) {
+    res.status(500).json({error: e.message});
+  }
 });
 
 module.exports = router;

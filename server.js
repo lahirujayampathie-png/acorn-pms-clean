@@ -10,6 +10,14 @@ async function startServer() {
   await db.init();   // sql.js must load before routes
   await db.migrate(); // apply schema updates
 
+  // Start notification scheduler
+  try {
+    const { startScheduler } = require('./notifications');
+    startScheduler(db);
+  } catch(e) {
+    console.warn('  [Notifications] Scheduler not started:', e.message);
+  }
+
   const app = express();
 
   app.use(helmet({ contentSecurityPolicy: { directives: {
