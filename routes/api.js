@@ -253,6 +253,24 @@ router.post('/goals/:empNo/submit', (req, res) => {
   db.prepare('UPDATE goal_sheets SET status = ?, submitted_at = ?, updated_at = ? WHERE id = ?')
     .run('submitted', now, now, sheet.id);
   db.logAudit(u.id, 'goals_submitted', 'goal_sheet', sheet.id, { emp_no: targetEmpNo }, req.ip);
+
+  // Notify supervisor that goals are pending their approval
+  try {
+    const emp = db.prepare('SELECT emp_no, name, reports_to FROM users WHERE emp_no=?').get(targetEmpNo);
+    if (emp && emp.reports_to) {
+      const supervisor = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(emp.reports_to);
+      if (supervisor) {
+        // Count total pending for this supervisor
+        const pendingCount = db.prepare(`SELECT COUNT(*) as n FROM goal_sheets gs
+          JOIN users u ON u.emp_no=gs.emp_no WHERE u.reports_to=? AND gs.cycle=? AND gs.status='submitted'`).get(emp.reports_to, CYCLE);
+        notify(db, 'goals_pending_approval', [supervisor], {
+          count: pendingCount ? pendingCount.n : 1,
+          names: [emp.name]
+        }).catch(()=>{});
+      }
+    }
+  } catch(e) { /* non-critical */ }
+
   res.json({ success: true });
 });
 
@@ -650,6 +668,13 @@ router.post('/reviews/:empNo/release-feedback', (req, res) => {
   db.prepare('UPDATE reviews SET feedback_released = 1, updated_at = ? WHERE sheet_id = ? AND review_type = ?')
     .run(Math.floor(Date.now()/1000), sheet.id, review_type || 'mid_year');
   db.logAudit(u.id, 'feedback_released', 'review', sheet.id, { emp_no: empNo, review_type }, req.ip);
+
+  // Notify employee their feedback is available
+  try {
+    const empUser = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
+    if (empUser) notify(db, 'midyear_feedback_released', [empUser], {}).catch(()=>{});
+  } catch(e) {}
+
   res.json({ success: true });
 });
 
@@ -796,6 +821,13 @@ router.post('/reviews/:empNo/pushback', (req, res) => {
       .run(sheet.id, review_type, reason, now, req.user.emp_no, now, now);
   }
   db.logAudit(req.user.id, 'review_pushed_back', 'review', sheet.id, {empNo, review_type, reason}, req.ip);
+
+  // Notify employee their review was pushed back
+  try {
+    const empUser = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
+    if (empUser) notify(db, 'review_pushed_back', [empUser], {reason}).catch(()=>{});
+  } catch(e) {}
+
   res.json({success:true});
 });
 
@@ -988,6 +1020,29 @@ router.post('/reviews/:empNo/submit-self-full', (req, res) => {
     return res.status(500).json({error:'Failed to submit review: ' + err.message});
   }
   db.logAudit(req.user.id,'self_review_submitted','review',sheet.id,{review_type},req.ip);
+
+  // Notify supervisor that employee has submitted their self-review
+  try {
+    const emp = db.prepare('SELECT name, reports_to FROM users WHERE emp_no=?').get(empNo);
+    if (emp && emp.reports_to) {
+      const supervisor = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(emp.reports_to);
+      if (supervisor) {
+        const phaseName = review_type === 'mid_year' ? 'Mid-Year Review' : 'Year-End Review';
+        // Count pending reviews for this supervisor
+        const pendingCount = db.prepare(`
+          SELECT COUNT(*) as n FROM reviews r
+          JOIN goal_sheets gs ON gs.id=r.sheet_id
+          JOIN users u ON u.emp_no=gs.emp_no
+          WHERE u.reports_to=? AND r.review_type=? AND r.self_submitted_at IS NOT NULL AND r.mgr_submitted_at IS NULL
+        `).get(emp.reports_to, review_type);
+        notify(db, 'goals_pending_approval', [supervisor], {
+          count: pendingCount ? pendingCount.n : 1,
+          names: [emp.name + ' (' + phaseName + ')']
+        }).catch(()=>{});
+      }
+    }
+  } catch(e) { /* non-critical */ }
+
   res.json({success:true, scores});
 });
 
@@ -1000,6 +1055,20 @@ router.post('/reviews/:empNo/manager-review-full', (req, res) => {
   const { review_type, comments, strengths, develop, supervisor_agrees, supervisor_comments_review, promo_recommended, promo_justification } = req.body;
   const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
   if (!sheet) return res.status(404).json({error:'No goal sheet found.'});
+
+  // GUARD 1: Goals must be approved before any review
+  if (sheet.status !== 'approved') {
+    return res.status(400).json({error:'Goals must be approved before the manager review can be submitted.'});
+  }
+
+  // GUARD 2: Employee must have submitted their self-assessment first (HR can bypass)
+  if (req.user.role !== 'hr_admin') {
+    const empReview = db.prepare('SELECT self_submitted_at FROM reviews WHERE sheet_id=? AND review_type=?').get(sheet.id, review_type);
+    if (!empReview || !empReview.self_submitted_at) {
+      return res.status(400).json({error:'The employee must submit their self-assessment before the supervisor review can be submitted.'});
+    }
+  }
+
   const now = Math.floor(Date.now()/1000);
   const scores = computeScores(sheet.id);
   try {
@@ -1164,6 +1233,22 @@ router.post('/goals/:empNo/change-requests', (req, res) => {
     .run(sheet.id, empNo, CYCLE, reason.trim(), JSON.stringify(krasWithKpis), midRev?1:0, now, now, now);
 
   db.logAudit(req.user.id,'goal_change_requested','goal_sheet',sheet.id,{reason:reason.trim(), post_midyear:!!midRev},req.ip);
+
+  // Notify supervisor + HR about the change request
+  try {
+    const emp = db.prepare('SELECT name, reports_to FROM users WHERE emp_no=?').get(empNo);
+    const notifData = { emp_name: emp ? emp.name : 'Employee', reason: reason.trim(), post_midyear: !!midRev };
+    if (emp && emp.reports_to) {
+      const supervisor = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(emp.reports_to);
+      if (supervisor) notify(db, 'goal_change_requested', [supervisor], notifData).catch(()=>{});
+    }
+    // Always notify HR on post-mid-year changes
+    if (midRev) {
+      const hrUsers = db.prepare("SELECT emp_no, email FROM users WHERE role='hr_admin' AND is_active=1").all();
+      notify(db, 'goal_change_requested', hrUsers, notifData).catch(()=>{});
+    }
+  } catch(e) { /* non-critical */ }
+
   res.json({success:true, post_midyear:!!midRev});
 });
 
@@ -1188,6 +1273,13 @@ router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
     .run(now, req.user.emp_no, comments||'', now, reqId);
 
   db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
+
+  // Notify employee their change request was approved
+  try {
+    const emp = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
+    if (emp) notify(db, 'goal_change_approved', [emp], {}).catch(()=>{});
+  } catch(e) {}
+
   res.json({success:true});
 });
 
@@ -1210,6 +1302,13 @@ router.post('/goals/:empNo/change-requests/:reqId/reject', (req, res) => {
     .run(now, req.user.emp_no, comments.trim(), now, reqId);
 
   db.logAudit(req.user.id,'goal_change_rejected','goal_sheet',cr.sheet_id,{req_id:reqId,reason:comments},req.ip);
+
+  // Notify employee their change request was rejected
+  try {
+    const emp = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
+    if (emp) notify(db, 'goal_change_rejected', [emp], {reason: comments}).catch(()=>{});
+  } catch(e) {}
+
   res.json({success:true});
 });
 
@@ -1422,13 +1521,18 @@ router.get('/performance/org-summary', (req, res) => {
 // ════════════════════════════════════════════════════════════
 
 router.get('/stats', requireHR, (req, res) => {
+  // Total = ALL active users including HR
   const total = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1").get().n;
+  // Activated = has logged in at least once (ALL users including HR)
+  const activated = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1 AND last_login IS NOT NULL").get().n;
+  // Non-HR count for goal stats context
   const totalNonHR = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1 AND role!='hr_admin'").get().n;
-  // Activated = user has logged in at least once (last_login IS NOT NULL)
-  const activated = db.prepare("SELECT COUNT(*) as n FROM users WHERE is_active=1 AND role!='hr_admin' AND last_login IS NOT NULL").get().n;
+  // Online Now = count of active (non-expired) sessions
+  const onlineNow = db.prepare("SELECT COUNT(DISTINCT user_id) as n FROM sessions WHERE expires_at > ?").get(Math.floor(Date.now()/1000)).n;
+
   const goalStats = db.prepare(`
     SELECT gs.status, COUNT(*) as n FROM goal_sheets gs
-    JOIN users u ON u.emp_no=gs.emp_no WHERE gs.cycle=? AND u.role!='hr_admin'
+    JOIN users u ON u.emp_no=gs.emp_no WHERE gs.cycle=? AND u.is_active=1
     GROUP BY gs.status
   `).all(CYCLE);
   const midStats = db.prepare(`
@@ -1480,7 +1584,8 @@ router.get('/stats', requireHR, (req, res) => {
     total_users: total,
     total_non_hr: totalNonHR,
     activated,
-    not_activated: totalNonHR - activated,
+    not_activated: total - activated,
+    online_now: onlineNow,
     goal_stats: goalStats,
     mid_year: midStats,
     year_end: yeStats,

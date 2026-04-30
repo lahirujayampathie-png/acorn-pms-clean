@@ -1,47 +1,36 @@
 // ═══════════════════════════════════════════════════════════════
 //  Acorn PMS — Email Notification Configuration
-//  IT SETUP INSTRUCTIONS:
-//  1. Fill in the SMTP settings below
-//  2. Set SMTP_ENABLED = true
-//  3. Restart the server
 // ═══════════════════════════════════════════════════════════════
 
 module.exports = {
 
-  // ── ENABLE / DISABLE ──────────────────────────────────────────
-  SMTP_ENABLED: false,   // Set to true once SMTP credentials are ready
+  SMTP_ENABLED: false,   // Set to true when ready to send live emails
 
-  // ── SMTP SETTINGS (Microsoft 365) ─────────────────────────────
   SMTP_HOST: 'smtp.office365.com',
   SMTP_PORT: 587,
-  SMTP_SECURE: false,    // false for port 587 (STARTTLS), true for port 465
+  SMTP_SECURE: false,
 
-  // The M365 mailbox that sends PMS emails (must have SMTP AUTH enabled)
-  SMTP_USER: 'pms@acorngroup.com',       // ← IT fills this in
-  SMTP_PASS: '',                          // ← IT fills this in
+  SMTP_USER: 'pms@acorn.lk',
+  SMTP_PASS: 'APm$2026#$%4',
 
-  // Sender display name and reply-to
   FROM_NAME:  'Acorn Group PMS',
-  FROM_EMAIL: 'pms@acorngroup.com',       // ← IT fills this in
-  REPLY_TO:   'hr@acorngroup.com',        // ← IT fills this in
+  FROM_EMAIL: 'pms@acorn.lk',
+  REPLY_TO:   'pms@acorn.lk',
 
-  // ── COMPANY INFO ──────────────────────────────────────────────
   COMPANY_NAME: 'Acorn Group',
-  PORTAL_URL:   'http://localhost:3000',  // ← IT changes to live server URL
+  PORTAL_URL:   'http://localhost:3000',
 
-  // ── REMINDER SCHEDULE ─────────────────────────────────────────
-  // How many days before deadline to send reminders
-  REMINDER_DAYS: [7, 3],        // 7 days before, then 3 days before
-  REMINDER_ON_DEADLINE: true,   // Send on the deadline day itself
-  OVERDUE_ALERT_DAYS: 1,        // HR alert X days after deadline
+  REMINDER_DAYS: [7, 3],
+  REMINDER_ON_DEADLINE: true,
+  OVERDUE_ALERT_DAYS: 1,
 
-  // ── NOTIFICATION RULES ────────────────────────────────────────
   NOTIFY: {
     goal_setting_opened:        true,
+    goals_pending_approval:     true,   // supervisor gets email when team submits
     goal_submitted_to_manager:  true,
     goal_approved:              true,
     goal_rejected:              true,
-    goal_change_requested:      true,   // to supervisor + HR
+    goal_change_requested:      true,
     goal_change_approved:       true,
     goal_change_rejected:       true,
     midyear_opened:             true,
@@ -49,8 +38,10 @@ module.exports = {
     midyear_feedback_released:  true,
     yearend_opened:             true,
     yearend_reminder:           true,
-    final_rating_published:     true,   // only after HR publishes
+    final_rating_published:     true,
     review_pushed_back:         true,
-    promotion_decided:          false,  // HR decides when to notify
+    promotion_decided:          false,
+    deadline_reminder:          true,
+    overdue_alert:              true,
   }
 };
