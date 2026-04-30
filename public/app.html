@@ -281,16 +281,6 @@ textarea.fi{resize:vertical;min-height:65px}select.fi{cursor:pointer}
         <span id="notif-badge" style="display:none;position:absolute;top:0;right:0;background:#DC2626;color:#fff;font-size:9px;font-weight:700;border-radius:10px;padding:1px 5px;min-width:16px;text-align:center;line-height:14px">0</span>
       </div>
     </div>
-    <div id="notif-panel" style="display:none;position:fixed;top:56px;right:12px;width:380px;max-height:500px;background:var(--bg,#fff);border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.18);border:1px solid #E5E7EB;z-index:9999;overflow:hidden;flex-direction:column">
-      <div style="padding:12px 16px;border-bottom:1px solid #E5E7EB;display:flex;align-items:center;justify-content:space-between;background:var(--bg,#fff)">
-        <div style="font-size:13px;font-weight:700;color:var(--g900,#111)">Notifications</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <button onclick="markAllNotifsRead()" style="font-size:10px;padding:3px 8px;border:1px solid #D1D5DB;border-radius:6px;background:#fff;cursor:pointer;color:#6B7280">Mark all read</button>
-          <button onclick="toggleNotifPanel()" style="font-size:16px;border:none;background:none;cursor:pointer;color:#6B7280;line-height:1">&times;</button>
-        </div>
-      </div>
-      <div id="notif-list" style="overflow-y:auto;max-height:420px"></div>
-    </div>
     <div id="content"><div class="empty">Loading&#8230;</div></div>
   </main>
 </div>
@@ -5245,5 +5235,16 @@ function savePhase(key){
   });
 }
 </script>
+<!-- Notification panel — body-level so position:fixed is never clipped by parent stacking contexts -->
+<div id="notif-panel" style="display:none;position:fixed;top:56px;right:12px;width:380px;max-height:500px;background:#fff;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.22);border:1px solid #E5E7EB;z-index:99999;overflow:hidden;flex-direction:column">
+  <div style="padding:12px 16px;border-bottom:1px solid #E5E7EB;display:flex;align-items:center;justify-content:space-between;background:#fff">
+    <div style="font-size:13px;font-weight:700;color:#111">Notifications</div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button onclick="markAllNotifsRead()" style="font-size:10px;padding:3px 8px;border:1px solid #D1D5DB;border-radius:6px;background:#fff;cursor:pointer;color:#6B7280">Mark all read</button>
+      <button onclick="toggleNotifPanel()" style="font-size:16px;border:none;background:none;cursor:pointer;color:#6B7280;line-height:1">&times;</button>
+    </div>
+  </div>
+  <div id="notif-list" style="overflow-y:auto;max-height:420px"></div>
+</div>
 </body>
 </html>
