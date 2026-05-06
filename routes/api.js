@@ -14,6 +14,53 @@ const {
 const router = express.Router();
 router.use(verifyToken);   // All API routes require auth
 
+// ── Auto-create new tables on startup (safe — IF NOT EXISTS) ─────────────
+(function initNewTables() {
+  // Per-employee review unlock overrides (Feature: HR unlocks mid/year-end for specific employees)
+  db.prepare(`CREATE TABLE IF NOT EXISTS review_overrides (
+    emp_no      INTEGER NOT NULL,
+    cycle       TEXT NOT NULL,
+    review_type TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    reason      TEXT,
+    set_by      INTEGER,
+    set_at      INTEGER,
+    PRIMARY KEY (emp_no, cycle, review_type)
+  )`).run();
+
+  // KPI target version history (Feature: track target changes mid-year with effective dates)
+  db.prepare(`CREATE TABLE IF NOT EXISTS kpi_target_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kpi_id         INTEGER NOT NULL,
+    target         REAL NOT NULL,
+    unit           TEXT,
+    effective_from TEXT NOT NULL,
+    effective_to   TEXT,
+    changed_by     INTEGER,
+    reason         TEXT,
+    created_at     INTEGER
+  )`).run();
+
+  // Add effective date columns to kras (safe — ignore if already exists)
+  try { db.prepare('ALTER TABLE kras ADD COLUMN effective_from TEXT').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE kras ADD COLUMN effective_to   TEXT').run(); } catch(e){}
+
+  // Add effective date columns to kpis
+  try { db.prepare('ALTER TABLE kpis ADD COLUMN effective_from TEXT').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE kpis ADD COLUMN effective_to   TEXT').run(); } catch(e){}
+
+  // Add join/proration columns to goal_sheets
+  try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN join_date     TEXT').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN fy_start_date TEXT').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN fy_end_date   TEXT').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN skip_mid_year INTEGER DEFAULT 0').run(); } catch(e){}
+
+  // Reset stale failed_attempts on startup (prevent spurious lockouts after server restart)
+  // Only clear if locked_until has already expired — active locks remain
+  const now = Math.floor(Date.now()/1000);
+  db.prepare('UPDATE users SET failed_attempts=0, locked_until=NULL WHERE failed_attempts>0 AND (locked_until IS NULL OR locked_until <= ?)').run(now);
+})();
+
 // Reports access: sbu_head (own companies via subtree), exco + hr_admin (group-wide)
 // senior_manager and below cannot access reports
 function requireReportsAccess(req, res, next) {
@@ -495,6 +542,23 @@ router.put('/goals/:empNo/kpis', (req, res) => {
 // REVIEWS
 // ════════════════════════════════════════════════════════════
 
+// ── Review access helper — checks global window + per-employee override ──────
+function canAccessReview(empNo, reviewType, cycle) {
+  // Check for HR override first
+  const override = db.prepare(
+    'SELECT state FROM review_overrides WHERE emp_no=? AND cycle=? AND review_type=?'
+  ).get(empNo, cycle, reviewType);
+  if (override) {
+    return override.state === 'open'; // HR explicitly opened or locked
+  }
+  // Fall back to global cycle window
+  const c = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get(cycle);
+  if (!c) return false;
+  if (reviewType === 'mid_year') return !!c.mid_year_open;
+  if (reviewType === 'year_end') return !!c.year_end_open;
+  return false;
+}
+
 // POST /api/reviews/:empNo/submit-self — employee submits self-evaluation
 router.post('/reviews/:empNo/submit-self', (req, res) => {
   const targetEmpNo = parseInt(req.params.empNo);
@@ -749,8 +813,68 @@ function getFullGoalSheet(empNo) {
 
 function computeScores(sheetId, phase) {
   const useEnd = phase === 'end';
-  const kras = db.prepare('SELECT * FROM kras WHERE sheet_id = ?').all(sheetId);
+  const sheet  = db.prepare('SELECT * FROM goal_sheets WHERE id=?').get(sheetId);
+  // FY dates — fall back to full year if not set
+  const fyStart = sheet?.fy_start_date || null;
+  const fyEnd   = sheet?.fy_end_date   || null;
+  const kras    = db.prepare('SELECT * FROM kras WHERE sheet_id = ?').all(sheetId);
   let overallWeighted = 0, totalKraWt = 0;
+
+  // Helper: get target version history for a KPI
+  function getTargetHistory(kpiId) {
+    return db.prepare(
+      'SELECT * FROM kpi_target_history WHERE kpi_id=? ORDER BY effective_from ASC'
+    ).all(kpiId);
+  }
+
+  // Helper: compute weighted score using versioned targets + monthly progress
+  // Returns null if no data, or the blended achievement %
+  function versionedScore(kpi, monthlyEntries, fyStartDate, fyEndDate) {
+    const history = getTargetHistory(kpi.id);
+    if (!history.length) return null; // no versioned targets — use legacy ach fields
+
+    // Build monthly target map: month 1-12 → target (from version active that month)
+    const cycleYear = parseInt((CYCLE||'2026-27').split('-')[0]);
+    const fyS = fyStartDate ? new Date(fyStartDate) : new Date(`${cycleYear}-04-01`);
+    const fyE = fyEndDate   ? new Date(fyEndDate)   : new Date(`${cycleYear+1}-03-31`);
+
+    let totalTarget = 0;
+    let totalAchieved = 0;
+    let hasData = false;
+
+    for (let m = 1; m <= 12; m++) {
+      // Calendar date of this FY month
+      const mDate = new Date(fyS);
+      mDate.setMonth(fyS.getMonth() + (m - 1));
+      if (mDate > fyE) break; // beyond employee's FY end
+
+      // Find which target version was active this month
+      const mStr = mDate.toISOString().slice(0, 7); // YYYY-MM
+      let activeTarget = null;
+      for (const v of history) {
+        const vFrom = v.effective_from ? v.effective_from.slice(0,7) : '0000-00';
+        const vTo   = v.effective_to   ? v.effective_to.slice(0,7)   : '9999-99';
+        if (mStr >= vFrom && mStr <= vTo) { activeTarget = v.target; break; }
+      }
+      if (activeTarget === null) continue;
+
+      totalTarget += activeTarget / 12; // monthly slice of annual target
+
+      // Find monthly achievement for this month
+      const entry = monthlyEntries.find(e => e.kpi_id === kpi.id && e.month === m);
+      if (entry?.increment_ach != null) {
+        totalAchieved += parseFloat(entry.increment_ach);
+        hasData = true;
+      }
+    }
+    if (!hasData || totalTarget === 0) return null;
+    return Math.round((totalAchieved / totalTarget * 100) * 10) / 10;
+  }
+
+  // Load monthly progress for blended scoring
+  const monthlyEntries = db.prepare(
+    'SELECT * FROM monthly_progress WHERE sheet_id=? AND fy_year=?'
+  ).all(sheetId, CYCLE);
 
   const kraScores = kras.map(kra => {
     const kpis = db.prepare('SELECT * FROM kpis WHERE kra_id = ?').all(kra.id);
@@ -758,8 +882,15 @@ function computeScores(sheetId, phase) {
     let mgrKraAch = 0, mgrHasAny = false;
 
     kpis.forEach(kpi => {
-      // KRA achievement = sum(kpi_ach × kpi_weight/100)
-      const empAch = useEnd ? (kpi.end_ach != null ? kpi.end_ach : kpi.mid_ach) : kpi.mid_ach;
+      // Try versioned score first; fall back to legacy ach fields
+      const versioned = versionedScore(kpi, monthlyEntries, fyStart, fyEnd);
+
+      let empAch;
+      if (versioned !== null) {
+        empAch = versioned;
+      } else {
+        empAch = useEnd ? (kpi.end_ach != null ? kpi.end_ach : kpi.mid_ach) : kpi.mid_ach;
+      }
       if (empAch != null) { empKraAch += empAch * (kpi.kpi_weight / 100); empHasAny = true; }
 
       const mgrAch = useEnd ? (kpi.mgr_end_ach != null ? kpi.mgr_end_ach : kpi.mgr_mid_ach) : kpi.mgr_mid_ach;
@@ -769,13 +900,14 @@ function computeScores(sheetId, phase) {
     const empNorm = empHasAny ? Math.round(empKraAch * 10) / 10 : null;
     const mgrNorm = mgrHasAny ? Math.round(mgrKraAch * 10) / 10 : null;
 
-    // Overall = sum(kra_ach × kra_weight/100)
     if (empNorm !== null) { overallWeighted += empNorm * (kra.kra_weight / 100); totalKraWt += kra.kra_weight; }
 
     return {
       kra_id: kra.id,
       kra_name: kra.kra_name,
       kra_weight: kra.kra_weight,
+      effective_from: kra.effective_from || null,
+      effective_to:   kra.effective_to   || null,
       score: empNorm,
       mgr_score: mgrNorm,
       rating: empNorm !== null ? getSystemRating((empNorm / kra.kra_weight) * 100) : null,
@@ -783,14 +915,17 @@ function computeScores(sheetId, phase) {
     };
   });
 
-  // Normalise if not all KRAs have data
   const overall = totalKraWt > 0
     ? Math.round((totalKraWt === 100 ? overallWeighted : overallWeighted / totalKraWt * 100) * 10) / 10
     : null;
-  const rating  = overall !== null ? getSystemRating(overall) : null;
+  const rating     = overall !== null ? getSystemRating(overall) : null;
   const ratingInfo = rating ? RATING_SCALE.find(r => r.r === rating) : null;
 
-  return { kra_scores: kraScores, overall, rating, rating_label: ratingInfo?.label, rating_desc: ratingInfo?.desc };
+  return {
+    kra_scores: kraScores, overall, rating,
+    rating_label: ratingInfo?.label, rating_desc: ratingInfo?.desc,
+    is_prorated: !!(sheet?.join_date || sheet?.fy_start_date)
+  };
 }
 
 function getSystemRating(pct) {
@@ -875,23 +1010,17 @@ router.get('/cycle', (req, res) => {
     mid_start:'2026-10-01', mid_end:'2026-10-31',
     ye_start:'2027-03-15', ye_end:'2027-03-31'};
 
-  // Auto-open/close based on dates if dates are set
+  // Auto-close only — never auto-open. HR must manually open each window.
   const today = new Date().toISOString().slice(0,10);
   let changed = false;
   if (s.gs_start && s.gs_end) {
-    const shouldBeOpen = today >= s.gs_start && today <= s.gs_end ? 1 : s.goal_setting_open;
-    // Only auto-close; never auto-open (HR must manually open)
-    // But do auto-open if within window
-    const autoOpen = today >= s.gs_start && today <= s.gs_end ? 1 : 0;
-    if (autoOpen !== s.goal_setting_open) { s.goal_setting_open = autoOpen; changed = true; }
+    if (s.goal_setting_open && today > s.gs_end) { s.goal_setting_open = 0; changed = true; }
   }
   if (s.mid_start && s.mid_end) {
-    const autoOpen = today >= s.mid_start && today <= s.mid_end ? 1 : 0;
-    if (autoOpen !== s.mid_year_open) { s.mid_year_open = autoOpen; changed = true; }
+    if (s.mid_year_open && today > s.mid_end) { s.mid_year_open = 0; changed = true; }
   }
   if (s.ye_start && s.ye_end) {
-    const autoOpen = today >= s.ye_start && today <= s.ye_end ? 1 : 0;
-    if (autoOpen !== s.year_end_open) { s.year_end_open = autoOpen; changed = true; }
+    if (s.year_end_open && today > s.ye_end) { s.year_end_open = 0; changed = true; }
   }
   if (changed) {
     db.prepare('UPDATE cycle_settings SET goal_setting_open=?, mid_year_open=?, year_end_open=?, updated_at=? WHERE id=1')
@@ -2202,6 +2331,128 @@ router.get('/export/employee-directory', requireReportsAccess, (req, res) => {
   res.setHeader('Content-Type','text/csv');
   res.setHeader('Content-Disposition','attachment; filename="employee-directory.csv"');
   res.send(csv);
+});
+
+
+// ════════════════════════════════════════════════════════════
+// REVIEW OVERRIDES — HR can unlock mid/year-end for individual employees
+// ════════════════════════════════════════════════════════════
+
+// GET /api/review-overrides/:empNo — get all overrides for an employee
+router.get('/review-overrides/:empNo', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const overrides = db.prepare(
+    'SELECT * FROM review_overrides WHERE emp_no=? AND cycle=?'
+  ).all(empNo, CYCLE);
+  res.json(overrides);
+});
+
+// POST /api/review-overrides/:empNo — set or clear an override
+// Body: { review_type: 'mid_year'|'year_end', state: 'open'|'locked'|null, reason: '...' }
+router.post('/review-overrides/:empNo', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const { review_type, state, reason } = req.body;
+  if (!['mid_year','year_end'].includes(review_type)) {
+    return res.status(400).json({ error: 'Invalid review_type' });
+  }
+  const now = Math.floor(Date.now()/1000);
+  if (!state) {
+    // Clear override — employee follows global window
+    db.prepare('DELETE FROM review_overrides WHERE emp_no=? AND cycle=? AND review_type=?')
+      .run(empNo, CYCLE, review_type);
+    db.logAudit(req.user.id,'review_override_cleared','review_override',null,{empNo,review_type},req.ip);
+    return res.json({ success:true, cleared:true });
+  }
+  if (!['open','locked'].includes(state)) {
+    return res.status(400).json({ error: 'state must be open, locked, or null' });
+  }
+  db.prepare(`
+    INSERT INTO review_overrides(emp_no,cycle,review_type,state,reason,set_by,set_at)
+    VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(emp_no,cycle,review_type) DO UPDATE SET
+      state=excluded.state, reason=excluded.reason, set_by=excluded.set_by, set_at=excluded.set_at
+  `).run(empNo, CYCLE, review_type, state, reason||null, req.user.emp_no, now);
+  db.logAudit(req.user.id,'review_override_set','review_override',null,{empNo,review_type,state,reason},req.ip);
+  res.json({ success:true, empNo, review_type, state });
+});
+
+// GET /api/review-overrides — all active overrides for current cycle (HR dashboard)
+router.get('/review-overrides', requireHR, (req, res) => {
+  const overrides = db.prepare(`
+    SELECT ro.*, u.name as emp_name, u.company, hr.name as set_by_name
+    FROM review_overrides ro
+    JOIN users u ON u.emp_no=ro.emp_no
+    LEFT JOIN users hr ON hr.emp_no=ro.set_by
+    WHERE ro.cycle=?
+    ORDER BY ro.set_at DESC
+  `).all(CYCLE);
+  res.json(overrides);
+});
+
+// ════════════════════════════════════════════════════════════
+// GOAL SHEET JOIN DATE / PRORATION — HR sets join context on goal sheet
+// ════════════════════════════════════════════════════════════
+
+// GET /api/goals/:empNo/join-context
+router.get('/goals/:empNo/join-context', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const sheet = db.prepare('SELECT join_date,fy_start_date,fy_end_date,skip_mid_year FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  res.json(sheet || {});  // always return 200 -- empty object if no sheet yet
+});
+
+// PUT /api/goals/:empNo/join-context — set proration context
+router.put('/goals/:empNo/join-context', requireHR, (req, res) => {
+  const empNo = parseInt(req.params.empNo);
+  const { join_date, fy_start_date, fy_end_date, skip_mid_year } = req.body;
+  const now = Math.floor(Date.now()/1000);
+  let sheet = db.prepare('SELECT id FROM goal_sheets WHERE emp_no=? AND cycle=?').get(empNo, CYCLE);
+  if (!sheet) {
+    // Create a minimal goal sheet so we can attach join context to it
+    const result = db.prepare(
+      'INSERT INTO goal_sheets(emp_no,cycle,status,join_date,fy_start_date,fy_end_date,skip_mid_year,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)'
+    ).run(empNo, CYCLE, 'draft', join_date||null, fy_start_date||null, fy_end_date||null, skip_mid_year?1:0, now, now);
+    db.logAudit(req.user.id,'join_context_created','goal_sheet',result.lastInsertRowid,{empNo,join_date,fy_start_date,fy_end_date,skip_mid_year},req.ip);
+    return res.json({ success: true, created: true });
+  }
+  db.prepare(`
+    UPDATE goal_sheets SET join_date=?, fy_start_date=?, fy_end_date=?, skip_mid_year=?, updated_at=? WHERE id=?
+  `).run(join_date||null, fy_start_date||null, fy_end_date||null, skip_mid_year?1:0, now, sheet.id);
+  db.logAudit(req.user.id,'join_context_set','goal_sheet',sheet.id,{empNo,join_date,fy_start_date,fy_end_date,skip_mid_year},req.ip);
+  res.json({ success: true });
+});
+
+// ════════════════════════════════════════════════════════════
+// KPI TARGET VERSIONING — set/view target history for a KPI
+// ════════════════════════════════════════════════════════════
+
+// GET /api/kpi-target-history/:kpiId
+router.get('/kpi-target-history/:kpiId', (req, res) => {
+  const kpiId = parseInt(req.params.kpiId);
+  // Check user can access this KPI via its goal sheet
+  const kpi = db.prepare('SELECT kpis.*, kras.sheet_id FROM kpis JOIN kras ON kras.id=kpis.kra_id WHERE kpis.id=?').get(kpiId);
+  if (!kpi) return res.status(404).json({ error: 'KPI not found' });
+  const sheet = db.prepare('SELECT * FROM goal_sheets WHERE id=?').get(kpi.sheet_id);
+  if (!canAccessEmployee(req.user, sheet.emp_no)) return res.status(403).json({ error: 'Access denied' });
+  const history = db.prepare('SELECT * FROM kpi_target_history WHERE kpi_id=? ORDER BY effective_from ASC').all(kpiId);
+  res.json(history);
+});
+
+// POST /api/kpi-target-history/:kpiId — add a new target version (HR or goal change approval)
+router.post('/kpi-target-history/:kpiId', requireHR, (req, res) => {
+  const kpiId = parseInt(req.params.kpiId);
+  const { target, unit, effective_from, reason } = req.body;
+  if (!target || !effective_from) return res.status(400).json({ error: 'target and effective_from required' });
+  const now = Math.floor(Date.now()/1000);
+  // Close the current open version
+  db.prepare('UPDATE kpi_target_history SET effective_to=? WHERE kpi_id=? AND effective_to IS NULL')
+    .run(new Date(new Date(effective_from).getTime() - 86400000).toISOString().slice(0,10), kpiId);
+  // Insert new version
+  db.prepare(`
+    INSERT INTO kpi_target_history(kpi_id,target,unit,effective_from,effective_to,changed_by,reason,created_at)
+    VALUES(?,?,?,?,NULL,?,?,?)
+  `).run(kpiId, parseFloat(target), unit||null, effective_from, req.user.emp_no, reason||null, now);
+  db.logAudit(req.user.id,'kpi_target_versioned','kpi',kpiId,{target,effective_from,reason},req.ip);
+  res.json({ success: true });
 });
 
 module.exports = router;

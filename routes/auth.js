@@ -14,8 +14,8 @@ const router = express.Router();
 
 const SALT_ROUNDS     = 12;
 const SESSION_SECONDS = 8 * 60 * 60;   // 8 hours
-const MAX_ATTEMPTS    = 5;             // lock after 5 failed attempts
-const LOCK_SECONDS    = 15 * 60;       // 15-minute lockout
+const MAX_ATTEMPTS    = 10;            // lock after 10 failed attempts
+const LOCK_SECONDS    = 5 * 60;        // 5-minute lockout
 
 // ─────────────────────────────────────────────────────────────
 // POST /auth/login
@@ -52,6 +52,12 @@ router.post('/login', async (req, res) => {
       error: `Account locked due to too many failed attempts. Try again in ${remaining} minute(s).`
     });
   }
+  // If lock has expired, clear it now
+  if (user.locked_until && user.locked_until <= now) {
+    db.prepare('UPDATE users SET failed_attempts=0, locked_until=NULL WHERE emp_no=?').run(empNo);
+    user.failed_attempts = 0;
+    user.locked_until = null;
+  }
 
   // Account not activated yet (no password set)
   if (!user.password_hash) {
@@ -79,7 +85,7 @@ router.post('/login', async (req, res) => {
     const remaining = MAX_ATTEMPTS - newAttempts;
     if (remaining <= 0) {
       return res.status(429).json({
-        error: `Too many failed attempts. Account locked for 15 minutes.`
+        error: `Too many failed attempts. Account locked for 5 minutes.`
       });
     }
     return res.status(401).json({
