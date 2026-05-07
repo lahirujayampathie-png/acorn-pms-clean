@@ -55,6 +55,11 @@ router.use(verifyToken);   // All API routes require auth
   try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN fy_end_date   TEXT').run(); } catch(e){}
   try { db.prepare('ALTER TABLE goal_sheets ADD COLUMN skip_mid_year INTEGER DEFAULT 0').run(); } catch(e){}
 
+  // Add sup_approved columns to goal_change_requests for Option D two-step flow
+  try { db.prepare('ALTER TABLE goal_change_requests ADD COLUMN sup_approved_at INTEGER').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE goal_change_requests ADD COLUMN sup_approved_by INTEGER').run(); } catch(e){}
+  try { db.prepare('ALTER TABLE goal_change_requests ADD COLUMN sup_comments TEXT').run(); } catch(e){}
+
   // Reset stale failed_attempts on startup (prevent spurious lockouts after server restart)
   // Only clear if locked_until has already expired — active locks remain
   const now = Math.floor(Date.now()/1000);
@@ -1413,34 +1418,75 @@ router.post('/goals/:empNo/change-requests', (req, res) => {
 });
 
 // POST /api/goals/:empNo/change-requests/:reqId/approve — supervisor/HR approves change request
+// Option D: normal changes = supervisor approves, done.
+//           post-mid-year = supervisor approves → status becomes 'pending_hr' → HR must confirm.
 router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
   const empNo = parseInt(req.params.empNo);
   const reqId = parseInt(req.params.reqId);
   const emp = db.prepare('SELECT reports_to FROM users WHERE emp_no=?').get(empNo);
-  if (req.user.role !== 'hr_admin' && emp?.reports_to !== req.user.emp_no) {
-    return res.status(403).json({error:'Only the direct supervisor or HR can approve change requests.'});
+  const isHRAdmin = req.user.role === 'hr_admin';
+  const isSupervisor = emp?.reports_to === req.user.emp_no;
+  if (!isHRAdmin && !isSupervisor) {
+    return res.status(403).json({ error: 'Only the direct supervisor or HR can approve change requests.' });
   }
   const { comments } = req.body;
   const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
-  if (!cr) return res.status(404).json({error:'Change request not found.'});
-  if (cr.status !== 'pending') return res.status(400).json({error:'This change request has already been reviewed.'});
+  if (!cr) return res.status(404).json({ error: 'Change request not found.' });
+
+  // HR can only act on pending_hr (post-mid-year awaiting HR sign-off)
+  // Supervisor can only act on pending
+  if (isHRAdmin && !isSupervisor) {
+    if (cr.status !== 'pending_hr') {
+      return res.status(400).json({ error: 'This request is not awaiting HR approval.' });
+    }
+  } else {
+    if (cr.status !== 'pending') {
+      return res.status(400).json({ error: 'This change request has already been reviewed.' });
+    }
+  }
 
   const now = Math.floor(Date.now()/1000);
-  // Reopen the goal sheet for editing
+
+  // Post-mid-year + supervisor acting = move to pending_hr for HR sign-off
+  if (cr.is_post_midyear && isSupervisor && !isHRAdmin) {
+    db.prepare(`UPDATE goal_change_requests
+      SET status='pending_hr', sup_approved_at=?, sup_approved_by=?, sup_comments=?, updated_at=?
+      WHERE id=?`).run(now, req.user.emp_no, comments||'', now, reqId);
+
+    db.logAudit(req.user.id,'goal_change_sup_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
+
+    // Notify HR to complete sign-off
+    try {
+      const hrUsers = db.prepare("SELECT emp_no, email FROM users WHERE role='hr_admin' AND is_active=1").all();
+      const empUser = db.prepare('SELECT name FROM users WHERE emp_no=?').get(empNo);
+      notify(db, 'goal_change_requested', hrUsers, {
+        emp_name: empUser?.name,
+        reason: cr.reason,
+        post_midyear: true,
+        supervisor_approved: true
+      }).catch(()=>{});
+    } catch(e) {}
+
+    return res.json({ success: true, pending_hr: true,
+      message: 'Supervisor approved. This is a post-mid-year change — HR sign-off required before employee can edit.' });
+  }
+
+  // All other cases (normal change by supervisor, or HR approving pending_hr) = fully approved
   db.prepare("UPDATE goal_sheets SET status='approved',last_changed_at=?,change_count=COALESCE(change_count,0)+1,updated_at=? WHERE id=?")
     .run(now, now, cr.sheet_id);
-  db.prepare(`UPDATE goal_change_requests SET status='approved',reviewed_at=?,reviewed_by=?,reviewer_comments=?,updated_at=? WHERE id=?`)
+  db.prepare(`UPDATE goal_change_requests
+    SET status='approved', reviewed_at=?, reviewed_by=?, reviewer_comments=?, updated_at=? WHERE id=?`)
     .run(now, req.user.emp_no, comments||'', now, reqId);
 
   db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
 
-  // Notify employee their change request was approved
+  // Notify employee
   try {
-    const emp = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
-    if (emp) notify(db, 'goal_change_approved', [emp], {}).catch(()=>{});
+    const empUser = db.prepare('SELECT emp_no, email FROM users WHERE emp_no=?').get(empNo);
+    if (empUser) notify(db, 'goal_change_approved', [empUser], {}).catch(()=>{});
   } catch(e) {}
 
-  res.json({success:true});
+  res.json({ success: true, pending_hr: false });
 });
 
 // POST /api/goals/:empNo/change-requests/:reqId/reject — supervisor/HR rejects change request
@@ -1476,12 +1522,32 @@ router.post('/goals/:empNo/change-requests/:reqId/reject', (req, res) => {
 router.get('/goals/change-requests/pending', requireHR, (req, res) => {
   const reqs = db.prepare(`
     SELECT gcr.*, u.name as emp_name, u.designation, u.company,
-           sup.name as supervisor_name, sup.emp_no as supervisor_emp_no
+           sup.name as supervisor_name, sup.emp_no as supervisor_emp_no,
+           sa.name as sup_approved_by_name
     FROM goal_change_requests gcr
     JOIN users u ON u.emp_no = gcr.emp_no
     LEFT JOIN users sup ON sup.emp_no = u.reports_to
-    WHERE gcr.cycle = ? AND gcr.status = 'pending'
-    ORDER BY gcr.is_post_midyear DESC, gcr.requested_at ASC
+    LEFT JOIN users sa ON sa.emp_no = gcr.sup_approved_by
+    WHERE gcr.cycle = ? AND gcr.status IN ('pending','pending_hr')
+    ORDER BY gcr.status DESC, gcr.is_post_midyear DESC, gcr.requested_at ASC
+  `).all(CYCLE);
+  res.json(reqs);
+});
+
+// GET /api/goals/change-requests/all — HR gets full history of all change requests
+router.get('/goals/change-requests/all', requireHR, (req, res) => {
+  const reqs = db.prepare(`
+    SELECT gcr.*, u.name as emp_name, u.designation, u.company,
+           sup.name as supervisor_name,
+           rev.name as reviewed_by_name,
+           sa.name as sup_approved_by_name
+    FROM goal_change_requests gcr
+    JOIN users u ON u.emp_no = gcr.emp_no
+    LEFT JOIN users sup ON sup.emp_no = u.reports_to
+    LEFT JOIN users rev ON rev.emp_no = gcr.reviewed_by
+    LEFT JOIN users sa ON sa.emp_no = gcr.sup_approved_by
+    WHERE gcr.cycle = ?
+    ORDER BY gcr.is_post_midyear DESC, gcr.requested_at DESC
   `).all(CYCLE);
   res.json(reqs);
 });
@@ -1757,7 +1823,7 @@ router.get('/stats', requireReportsAccess, (req, res) => {
   `).all(CYCLE, ...sp);
 
   const pendingChanges = req.user.role === 'hr_admin'
-    ? db.prepare("SELECT COUNT(*) as n FROM goal_change_requests WHERE cycle=? AND status='pending'").get(CYCLE).n : 0;
+    ? db.prepare("SELECT COUNT(*) as n FROM goal_change_requests WHERE cycle=? AND status IN ('pending','pending_hr')").get(CYCLE).n : 0;
 
   res.json({
     total_users: total,

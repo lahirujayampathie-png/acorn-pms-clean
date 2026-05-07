@@ -742,7 +742,7 @@ function updateCyclePill(){
 // ── NAVIGATION ───────────────────────────────────────────────
 var PTITLES={dashboard:'Dashboard',myGoals:'My Goals',myReviews:'My Reviews',
   teamGoals:'Team Goals',teamReviews:'Team Reviews',approvals:'Approvals',
-  hrDashboard:'HR Dashboard',userMgmt:'User Management',hrReviews:'HR Reviews',
+  hrDashboard:'HR Dashboard',userMgmt:'User Management',hrReviews:'HR Reviews',changeReqs:'Goal Change Requests',
   calibration:'Calibration',promotions:'Promotions',analytics:'Performance Analytics',
   reports:'Reports',employees:'Employee Directory',history:'Past Reviews'};
 function go(page){
@@ -778,6 +778,7 @@ function renderNav(){
   if(isHR())secs.push({lbl:'HR Admin',items:[
     {p:'hrDashboard',ic:'\u25c8',lbl:'HR Dashboard'},
     {p:'hrReviews',  ic:'\u25d0',lbl:'HR Reviews'},
+    {p:'changeReqs', ic:'\u270f',lbl:'Change Requests',badge:G.pendingChangeCount||0},
     {p:'userMgmt',   ic:'\u2699',lbl:'User Mgmt'},
     {p:'calibration',ic:'\u2605',lbl:'Calibration'},
     {p:'promotions', ic:'\ud83c\udfc5',lbl:'Promotions'},
@@ -810,6 +811,7 @@ function loadPage(p){
   var pgs={dashboard:pgDash,myGoals:pgGoals,myReviews:pgReviews,
     teamGoals:pgTeamGoals,teamReviews:pgTeamReviews,approvals:pgApprovals,
     hrDashboard:pgHRDash,userMgmt:pgUserMgmt,hrReviews:pgHRReviews,
+    changeReqs:pgChangeReqs,
     calibration:pgCalib,promotions:pgPromotions,analytics:pgAnalytics,
     reports:pgReports,employees:pgEmployees,history:pgHistory};
   if(pgs[p])pgs[p]();else setContent('<div class="empty">Page not found</div>');
@@ -2839,9 +2841,13 @@ function wireChangeReqBtns(reqs){
     var appBtn=sel('cr-app-'+cri);
     if(appBtn)appBtn.onclick=(function(en,rid){return function(){
       var cmt=(sel('cr-cmt-'+cri)||{}).value||'';
-      xhr('POST','/api/goals/'+en+'/change-requests/'+rid+'/approve',{comments:cmt},function(err){
+      xhr('POST','/api/goals/'+en+'/change-requests/'+rid+'/approve',{comments:cmt},function(err,res){
         if(err){toast(err,'error');return;}
-        toast('\u2713 Change request approved. Employee can now edit their goals.','ok');
+        if(res&&res.pending_hr){
+          toast('\u2713 Supervisor approved. Post mid-year change \u2014 awaiting HR sign-off.','info');
+        } else {
+          toast('\u2713 Approved. Employee can now edit their goals.','ok');
+        }
         pgApprovals();
       });
     };})(cr.emp_no,cr.id);
@@ -3010,6 +3016,106 @@ function openAmendGoalModal(empNo){
 }
 
 // ── HR REVIEWS (HR Admin full access to all employee reviews) ──
+// HR CHANGE REQUESTS PAGE
+function pgChangeReqs(){
+  xhr('GET','/api/goals/change-requests/all',null,function(err,reqs){
+    if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
+    reqs=reqs||[];
+    var pending=reqs.filter(function(r){return r.status==='pending'||r.status==='pending_hr';});
+    var reviewed=reqs.filter(function(r){return r.status!=='pending';});
+
+    function buildReqCard(cr,i,showActions){
+      var sc={pending:{col:'var(--amber)',bg:'#FFFBEB',lbl:'Pending Supervisor'},
+              pending_hr:{col:'#7C3AED',bg:'#F5F3FF',lbl:'Pending HR Sign-off'},
+              approved:{col:'var(--green)',bg:'#F0FDF4',lbl:'Approved'},
+              rejected:{col:'var(--red)',bg:'#FEF2F2',lbl:'Rejected'}}[cr.status]||{col:'var(--g400)',bg:'var(--g50)',lbl:cr.status};
+      var h='<div class="card" style="margin-bottom:10px;border-left:3px solid '+sc.col+'">'+
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">'+
+        '<div style="flex:1">'+
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'+
+        '<span style="font-size:13px;font-weight:600;color:var(--g900)">'+esc(cr.emp_name)+'</span>'+
+        '<span style="font-size:10px;color:var(--g500)">'+esc(cr.designation||'')+'</span>'+
+        '<span style="font-size:10px;background:var(--g100);padding:2px 7px;border-radius:10px;color:var(--g600)">'+esc((cr.company||'').replace(' (Pvt) Ltd','').replace(' (Private) Limited',''))+'</span>'+
+        (cr.is_post_midyear?'<span style="font-size:9px;background:#FEF3C7;color:#92400E;padding:2px 7px;border-radius:10px;font-weight:700">⚠ POST MID-YEAR</span>':'')+
+        '<span style="font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;background:'+sc.bg+';color:'+sc.col+'">'+sc.lbl+'</span>'+
+        '</div>'+
+        '<div style="font-size:12px;color:var(--g800);margin-bottom:6px;padding:8px 10px;background:var(--g50);border-radius:var(--r)">'+
+        '<strong>Reason for change:</strong> '+esc(cr.reason||'')+'</div>'+
+        '<div style="font-size:10px;color:var(--g500);display:flex;gap:14px;flex-wrap:wrap;margin-bottom:4px">'+
+        '<span>Supervisor: '+esc(cr.supervisor_name||'Not assigned')+'</span>'+
+        '<span>Submitted: '+fmtD(cr.requested_at)+'</span>'+
+        (cr.sup_approved_at?'<span style="color:var(--blue)">\u2714 Sup approved: '+fmtD(cr.sup_approved_at)+' ('+esc(cr.sup_approved_by_name||'')+')</span>':'')+
+        (cr.reviewed_at?'<span>\u2713 HR reviewed: '+fmtD(cr.reviewed_at)+' by '+esc(cr.reviewed_by_name||'HR')+'</span>':'')+
+        '</div>'+
+        (cr.sup_comments?'<div style="font-size:11px;color:var(--g600);margin-top:6px;padding:6px 10px;background:#EFF6FF;border-radius:var(--r)"><strong>Supervisor comments:</strong> '+esc(cr.sup_comments)+'</div>':'')+
+        (cr.reviewer_comments?'<div style="font-size:11px;color:var(--g600);margin-top:6px;padding:6px 10px;background:#F0FDF4;border-radius:var(--r)"><strong>HR comments:</strong> '+esc(cr.reviewer_comments)+'</div>':'')+
+        (showActions?'<div class="fg" style="margin-top:10px;margin-bottom:0"><textarea class="fi" rows="2" id="hr-cr-cmt-'+i+'" placeholder="Add comments (required for rejection)…" style="font-size:11px"></textarea></div>':'')+
+        '</div>'+
+        '<div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">'+
+        '<button class="btn btn-sm" id="hr-cr-gs-'+i+'">View Goals</button>'+
+        (showActions&&cr.status==='pending_hr'?'<button class="btn btn-sm btn-blue" id="hr-cr-app-'+i+'">✓ Final HR Approve</button><button class="btn btn-sm btn-red" id="hr-cr-rej-'+i+'">✗ Reject</button>':'')+
+        (showActions&&cr.status==='pending'?'<button class="btn btn-sm btn-green" id="hr-cr-app-'+i+'">✓ Approve</button><button class="btn btn-sm btn-red" id="hr-cr-rej-'+i+'">✗ Reject</button>':'')+
+        '</div></div></div>';
+      return h;
+    }
+
+    var h='<div class="alert al-info" style="margin-bottom:14px">'+
+      '<strong>Goal Change Requests</strong> — Employees submit change requests to amend approved goals. '+
+      'The supervisor approves first. Post-mid-year requests are flagged and HR is notified automatically.</div>';
+
+    var nHR=pending.filter(function(r){return r.status==='pending_hr';}).length;
+    h+='<div style="font-size:13px;font-weight:700;color:var(--g800);margin-bottom:8px">'+
+      'Pending <span style="font-size:11px;font-weight:400;color:var(--g500)">('+pending.length+')</span>'+
+      (nHR?'<span style="margin-left:8px;font-size:10px;background:#F5F3FF;color:#7C3AED;padding:2px 8px;border-radius:10px;font-weight:600">⚠ '+nHR+' awaiting HR sign-off</span>':'')+
+      '</div>';
+    if(!pending.length){
+      h+='<div class="card" style="text-align:center;padding:28px;color:var(--g400)">✓ No pending change requests</div>';
+    } else {
+      pending.forEach(function(cr,i){ h+=buildReqCard(cr,i,true); });
+    }
+
+    h+='<div style="font-size:13px;font-weight:700;color:var(--g800);margin:20px 0 8px">'+
+      'History <span style="font-size:11px;font-weight:400;color:var(--g500)">('+reviewed.length+')</span></div>';
+    if(!reviewed.length){
+      h+='<div class="card" style="text-align:center;padding:20px;color:var(--g400)">No reviewed requests yet</div>';
+    } else {
+      reviewed.forEach(function(cr,i){ h+=buildReqCard(cr,pending.length+i,false); });
+    }
+
+    setContent(h);
+
+    // Wire pending buttons
+    pending.forEach(function(cr,i){
+      var gsb=sel('hr-cr-gs-'+i);
+      if(gsb)gsb.onclick=(function(en){return function(){openHRGoalModal(en);};})(cr.emp_no);
+      var app=sel('hr-cr-app-'+i);
+      if(app)app.onclick=(function(en,rid,ci){return function(){
+        var cmt=(sel('hr-cr-cmt-'+ci)||{}).value||'';
+        xhr('POST','/api/goals/'+en+'/change-requests/'+rid+'/approve',{comments:cmt},function(err){
+          if(err){toast(err,'error');return;}
+          toast('✓ Approved — employee can now edit their goals','ok');
+          G.pendingChangeCount=Math.max(0,(G.pendingChangeCount||1)-1);renderNav();pgChangeReqs();
+        });
+      };})(cr.emp_no,cr.id,i);
+      var rej=sel('hr-cr-rej-'+i);
+      if(rej)rej.onclick=(function(en,rid,ci){return function(){
+        var cmt=(sel('hr-cr-cmt-'+ci)||{}).value||'';
+        if(!cmt.trim()){toast('Please provide a reason for rejecting','error');return;}
+        xhr('POST','/api/goals/'+en+'/change-requests/'+rid+'/reject',{comments:cmt},function(err){
+          if(err){toast(err,'error');return;}
+          toast('Change request rejected','info');
+          G.pendingChangeCount=Math.max(0,(G.pendingChangeCount||1)-1);renderNav();pgChangeReqs();
+        });
+      };})(cr.emp_no,cr.id,i);
+    });
+    // Wire history view buttons
+    reviewed.forEach(function(cr,i){
+      var gsb=sel('hr-cr-gs-'+(pending.length+i));
+      if(gsb)gsb.onclick=(function(en){return function(){openHRGoalModal(en);};})(cr.emp_no);
+    });
+  });
+}
+
 function pgHRReviews(){
   xhr('GET','/admin/users?limit=500',null,function(err,users){
     if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
@@ -3259,6 +3365,7 @@ function pgHRDash(){
     G.cycle=cycle||{goal_setting_open:1,mid_year_open:0,year_end_open:0};updateCyclePill();
     xhr('GET','/api/stats',null,function(err,s){
       if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
+      G.pendingChangeCount=s.pending_changes||0; renderNav(); // update badge
       var gs={}; (s.goal_stats||[]).forEach(function(g){gs[g.status]=g.n;});
       var c=G.cycle;
       var cos=[...new Set((s.by_company||[]).map(function(c){return c.company;}))];
@@ -3273,7 +3380,7 @@ function pgHRDash(){
         sCard(totalActivated,'Activated',notActivated+' not yet logged in',totalActivated===totalUsers?'var(--green)':totalActivated>0?'var(--amber)':'var(--red)')+
         sCard(goalsApproved,'Goals Approved',goalsPending+' pending approval',goalsApproved>0?'var(--green)':null)+
         sCard(onlineNow,'Online Now','Active sessions',onlineNow>0?'var(--blue)':null)+
-        sCard(s.pending_changes||0,'Pending Changes','Goal change requests',s.pending_changes>0?'var(--amber)':null)+
+        '<div class="stat" style="cursor:pointer" onclick="go(\'changeReqs\')" title="View all change requests"><div class="stat-val" style="color:'+(s.pending_changes>0?'var(--amber)':'inherit')+'">'+((s.pending_changes)||0)+'</div><div class="stat-lbl">Pending Changes</div><div class="stat-sub">Goal change requests →</div></div>'+
         '</div>';
 
       // Cycle Control Panel
