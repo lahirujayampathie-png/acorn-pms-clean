@@ -85,14 +85,25 @@ function initQueue(db) {
     to_email    TEXT NOT NULL,
     subject     TEXT NOT NULL,
     html_body   TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | sending | sent | failed
+    status      TEXT NOT NULL DEFAULT 'pending',
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT,
     queued_at   INTEGER NOT NULL,
     sent_at     INTEGER,
-    batch_id    TEXT   -- groups emails from the same trigger
+    batch_id    TEXT
   )`).run();
-  console.log('  [Queue] Email queue table ready');
+
+  // Tracks which scheduled reminders have already fired — prevents re-sending every hour
+  db.prepare(`CREATE TABLE IF NOT EXISTS sent_reminders (
+    phase_key     TEXT NOT NULL,
+    reminder_type TEXT NOT NULL,
+    days_left     INTEGER,
+    cycle         TEXT NOT NULL,
+    sent_at       INTEGER NOT NULL,
+    PRIMARY KEY (phase_key, reminder_type, days_left, cycle)
+  )`).run();
+
+  console.log('  [Queue] Email queue tables ready');
 }
 
 // Add emails to the queue — returns immediately
@@ -333,66 +344,88 @@ function startScheduler(db) {
 }
 
 async function runPhaseChecks(db) {
-  const now = Math.floor(Date.now() / 1000);
-  const today = new Date(); today.setHours(0,0,0,0);
+  const now   = Math.floor(Date.now() / 1000);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
   const REMINDER_DAYS = cfg.REMINDER_DAYS || [7, 3];
+  const CYCLE = '2026-27';
 
   let cycle;
-  try { cycle = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get('2026-27'); }
+  try { cycle = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get(CYCLE); }
   catch(e) { return; }
   if (!cycle) return;
 
   const phases = [
-    { key:'gs',  name:'Goal Setting',   open:cycle.goal_setting_open, end:cycle.gs_end,  type:'deadline_reminder' },
-    { key:'mid', name:'Mid-Year Review', open:cycle.mid_year_open,     end:cycle.mid_end, type:'deadline_reminder' },
-    { key:'ye',  name:'Year-End Review', open:cycle.year_end_open,     end:cycle.ye_end,  type:'deadline_reminder' },
+    { key:'gs',  name:'Goal Setting',    open:cycle.goal_setting_open, end:cycle.gs_end  },
+    { key:'mid', name:'Mid-Year Review', open:cycle.mid_year_open,     end:cycle.mid_end },
+    { key:'ye',  name:'Year-End Review', open:cycle.year_end_open,     end:cycle.ye_end  },
   ];
 
   for (const phase of phases) {
-    if (!phase.open || !phase.end) continue;
-    const endDate = new Date(phase.end); endDate.setHours(0,0,0,0);
+    if (!phase.end) continue;
+    const endDate  = new Date(phase.end); endDate.setHours(0, 0, 0, 0);
     const daysLeft = Math.round((endDate - today) / 86400000);
 
-    if (REMINDER_DAYS.includes(daysLeft)) {
-      // Avoid sending duplicate reminders the same day
+    // ── Deadline reminder ──────────────────────────────────────
+    if (phase.open && REMINDER_DAYS.includes(daysLeft)) {
+      // Check sent_reminders table — fires exactly ONCE per phase per days_left per cycle
       const alreadySent = db.prepare(
-        `SELECT id FROM email_queue WHERE batch_id LIKE ? AND queued_at > ? LIMIT 1`
-      ).get(`reminder_${phase.key}_%`, now - 86400);
-      if (alreadySent) continue;
+        `SELECT phase_key FROM sent_reminders
+         WHERE phase_key=? AND reminder_type='deadline' AND days_left=? AND cycle=?`
+      ).get(phase.key, daysLeft, CYCLE);
 
-      let pending = [];
-      if (phase.key === 'gs') {
-        pending = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
-          LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle='2026-27'
-          WHERE u.is_active=1 AND u.role!='hr_admin'
-          AND (gs.id IS NULL OR gs.status IN ('draft','not_started'))`).all();
-      } else {
-        const rt = phase.key === 'mid' ? 'mid_year' : 'year_end';
-        pending = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
-          JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle='2026-27' AND gs.status='approved'
-          LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type=?
-          WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(rt);
-      }
+      if (!alreadySent) {
+        let pending = [];
+        if (phase.key === 'gs') {
+          pending = db.prepare(`
+            SELECT u.emp_no, u.email, u.name FROM users u
+            LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+            WHERE u.is_active=1 AND u.role!='hr_admin'
+            AND (gs.id IS NULL OR gs.status IN ('draft','not_started'))
+          `).all(CYCLE);
+        } else {
+          const rt = phase.key === 'mid' ? 'mid_year' : 'year_end';
+          pending = db.prepare(`
+            SELECT u.emp_no, u.email, u.name FROM users u
+            JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
+            LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type=?
+            WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL
+          `).all(CYCLE, rt);
+        }
 
-      if (pending.length) {
-        await notify(db, phase.type, pending, {
-          phase_name: phase.name,
-          deadline:   phase.end,
-          days_left:  daysLeft
-        });
-        console.log(`  [Scheduler] ${phase.name} reminder sent to ${pending.length} users (${daysLeft} days left)`);
+        if (pending.length) {
+          await notify(db, 'deadline_reminder', pending, {
+            phase_name: phase.name,
+            deadline:   phase.end,
+            days_left:  daysLeft
+          });
+          // Record that this reminder has been sent — prevents re-sending
+          db.prepare(
+            `INSERT OR IGNORE INTO sent_reminders(phase_key, reminder_type, days_left, cycle, sent_at)
+             VALUES(?, 'deadline', ?, ?, ?)`
+          ).run(phase.key, daysLeft, CYCLE, now);
+          console.log(`  [Scheduler] ${phase.name} ${daysLeft}-day reminder sent to ${pending.length} users`);
+        }
       }
     }
 
-    // Overdue alert to HR
+    // ── Overdue alert to HR (once per phase per cycle) ─────────
     if (daysLeft < 0 && cfg.NOTIFY.overdue_alert) {
-      const hrUsers = db.prepare(`SELECT emp_no, email FROM users WHERE role='hr_admin' AND is_active=1`).all();
-      if (hrUsers.length) {
-        const alreadyAlerted = db.prepare(
-          `SELECT id FROM email_queue WHERE batch_id LIKE ? AND queued_at > ? LIMIT 1`
-        ).get(`overdue_${phase.key}_%`, now - 86400);
-        if (!alreadyAlerted) {
+      const alreadyAlerted = db.prepare(
+        `SELECT phase_key FROM sent_reminders
+         WHERE phase_key=? AND reminder_type='overdue' AND cycle=?`
+      ).get(phase.key, CYCLE);
+
+      if (!alreadyAlerted) {
+        const hrUsers = db.prepare(
+          `SELECT emp_no, email FROM users WHERE role='hr_admin' AND is_active=1`
+        ).all();
+        if (hrUsers.length) {
           await notify(db, 'overdue_alert', hrUsers, { phase_name: phase.name });
+          db.prepare(
+            `INSERT OR IGNORE INTO sent_reminders(phase_key, reminder_type, days_left, cycle, sent_at)
+             VALUES(?, 'overdue', NULL, ?, ?)`
+          ).run(phase.key, CYCLE, now);
+          console.log(`  [Scheduler] Overdue alert sent for ${phase.name}`);
         }
       }
     }
