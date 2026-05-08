@@ -2162,9 +2162,9 @@ router.put('/notifications/:id/read', (req, res) => {
 });
 
 // POST /api/notifications/trigger — HR manually triggers a notification
+// Queues emails immediately and returns — no timeout regardless of recipient count
 router.post('/notifications/trigger', requireHR, async (req, res) => {
-  const { type, target } = req.body; // target: 'all' | 'pending_goals' | 'pending_mid' | 'pending_ye' | empNo
-  const CYCLE_LOCAL = CYCLE;
+  const { type, target } = req.body;
   let recipients = [];
 
   try {
@@ -2174,43 +2174,146 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
         WHERE u.is_active=1 AND u.role!='hr_admin'
-        AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE_LOCAL);
+        AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE);
     } else if (target === 'pending_mid') {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
         LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='mid_year'
-        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE_LOCAL);
+        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE);
     } else if (target === 'pending_ye') {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
         LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
-        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE_LOCAL);
-    } else if (target && target.length > 3) {
-      // Company name or individual emp no
+        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE);
+    } else if (target) {
+      // Individual employee by emp_no OR company name
       const empNoInt = parseInt(target);
       if (!isNaN(empNoInt) && String(empNoInt) === String(target)) {
-        const u = db.prepare('SELECT emp_no, email, name FROM users WHERE emp_no=?').get(empNoInt);
+        const u = db.prepare('SELECT emp_no, email, name FROM users WHERE emp_no=? AND is_active=1').get(empNoInt);
         if (u) recipients = [u];
+        else return res.status(404).json({ error: `Employee ${empNoInt} not found` });
       } else {
-        // Company name
         recipients = db.prepare("SELECT emp_no, email, name FROM users WHERE is_active=1 AND company=? AND role!='hr_admin'").all(target);
       }
     }
 
-    if (!recipients.length) return res.json({success:true, sent:0, message:'No matching recipients.'});
+    if (!recipients.length) return res.json({ success: true, queued: 0, message: 'No matching recipients.' });
 
-    const cycleSettings = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get(CYCLE_LOCAL);
+    const cycleSettings = db.prepare('SELECT * FROM cycle_settings WHERE cycle=?').get(CYCLE);
     const data = {
-      deadline: cycleSettings ? (type.includes('mid') ? cycleSettings.mid_end : type.includes('ye') || type.includes('yearend') ? cycleSettings.ye_end : cycleSettings.gs_end) : null,
-      days_left: 0,
+      deadline:   cycleSettings ? (type.includes('mid') ? cycleSettings.mid_end : type.includes('ye') || type.includes('yearend') ? cycleSettings.ye_end : cycleSettings.gs_end) : null,
+      days_left:  0,
       phase_name: type.includes('mid') ? 'Mid-Year Review' : type.includes('ye') || type.includes('yearend') ? 'Year-End Review' : 'Goal Setting'
     };
 
     const { notify: notifyFn } = require('../notifications');
     await notifyFn(db, type, recipients, data);
-    res.json({success:true, sent:recipients.length});
+
+    res.json({
+      success: true,
+      queued:  recipients.length,
+      in_app:  recipients.length,
+      message: `Notifications queued for ${recipients.length} recipient(s). Emails will be delivered in the background.`
+    });
   } catch(e) {
-    res.status(500).json({error: e.message});
+    console.error('[notifications/trigger]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/notifications/queue-stats — HR sees email queue status
+router.get('/notifications/queue-stats', requireHR, (req, res) => {
+  try {
+    const { getQueueStats } = require('../notifications');
+    const stats = getQueueStats(db);
+    // Also get recent batches
+    const recent = db.prepare(`
+      SELECT batch_id, status, COUNT(*) as count, MIN(queued_at) as queued_at
+      FROM email_queue
+      WHERE queued_at > strftime('%s','now') - 86400 * 7
+      GROUP BY batch_id, status
+      ORDER BY queued_at DESC LIMIT 30
+    `).all();
+    res.json({ stats, recent });
+  } catch(e) {
+    res.json({ stats: { pending:0, sending:0, sent:0, failed:0 }, recent: [] });
+  }
+});
+
+// POST /api/notifications/retry-failed — HR retries failed emails
+router.post('/notifications/retry-failed', requireHR, (req, res) => {
+  try {
+    const result = db.prepare(`
+      UPDATE email_queue SET status='pending', attempts=0, last_error=NULL
+      WHERE status='failed'
+    `).run();
+    res.json({ success: true, retrying: result.changes });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/notifications/retry-one — retry a single failed email
+router.post('/notifications/retry-one/:id', requireHR, (req, res) => {
+  try {
+    db.prepare(`UPDATE email_queue SET status='pending', attempts=0, last_error=NULL WHERE id=?`)
+      .run(parseInt(req.params.id));
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/notifications/queue/:id — delete a queue entry
+router.delete('/notifications/queue/:id', requireHR, (req, res) => {
+  try {
+    db.prepare('DELETE FROM email_queue WHERE id=?').run(parseInt(req.params.id));
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/notifications/queue — full email queue with filters
+router.get('/notifications/queue', requireHR, (req, res) => {
+  const { status, batch_id, page } = req.query;
+  const pageSize = 50;
+  const offset   = (parseInt(page)||0) * pageSize;
+  try {
+    const conditions = ["queued_at > strftime('%s','now') - 86400 * 30"];
+    const params = [];
+    if (status && status !== 'all') { conditions.push('status=?'); params.push(status); }
+    if (batch_id) { conditions.push('batch_id=?'); params.push(batch_id); }
+    const where = 'WHERE ' + conditions.join(' AND ');
+
+    const total  = db.prepare(`SELECT COUNT(*) as n FROM email_queue ${where}`).get(...params).n;
+    const rows   = db.prepare(`
+      SELECT id, emp_no, to_email, subject, status, attempts, last_error, queued_at, sent_at, batch_id
+      FROM email_queue ${where}
+      ORDER BY queued_at DESC LIMIT ${pageSize} OFFSET ${offset}
+    `).all(...params);
+
+    const counts = db.prepare(`
+      SELECT status, COUNT(*) as n FROM email_queue
+      WHERE queued_at > strftime('%s','now') - 86400 * 30
+      GROUP BY status
+    `).all();
+
+    const batches = db.prepare(`
+      SELECT batch_id,
+             COUNT(*) as total,
+             SUM(CASE WHEN status='sent'    THEN 1 ELSE 0 END) as sent,
+             SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) as failed,
+             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending,
+             MIN(queued_at) as queued_at
+      FROM email_queue
+      WHERE queued_at > strftime('%s','now') - 86400 * 30
+      GROUP BY batch_id ORDER BY queued_at DESC LIMIT 50
+    `).all();
+
+    res.json({ rows, total, counts, batches, page: parseInt(page)||0, pageSize });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

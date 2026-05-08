@@ -629,7 +629,9 @@ function renderNotifList(data){
 }
   xhr('POST','/api/notifications/trigger',{type:type,target:target},function(err,res){
     if(err){toast(err,'error');return;}
-    toast('\u2713 Notification sent to '+res.sent+' recipient'+(res.sent!==1?'s':'')+': '+label,'ok');
+    var n=res.queued||res.sent||0;
+    toast('\u2713 Queued for '+n+' recipient'+(n!==1?'s':'')+'. Emails will be delivered in the background.','ok');
+    loadQueueStatus();
   });
 }
 
@@ -742,7 +744,7 @@ function updateCyclePill(){
 // ── NAVIGATION ───────────────────────────────────────────────
 var PTITLES={dashboard:'Dashboard',myGoals:'My Goals',myReviews:'My Reviews',
   teamGoals:'Team Goals',teamReviews:'Team Reviews',approvals:'Approvals',
-  hrDashboard:'HR Dashboard',userMgmt:'User Management',hrReviews:'HR Reviews',changeReqs:'Goal Change Requests',
+  hrDashboard:'HR Dashboard',userMgmt:'User Management',hrReviews:'HR Reviews',changeReqs:'Goal Change Requests',emailQueue:'Email Queue',
   calibration:'Calibration',promotions:'Promotions',analytics:'Performance Analytics',
   reports:'Reports',employees:'Employee Directory',history:'Past Reviews'};
 function go(page){
@@ -782,7 +784,8 @@ function renderNav(){
     {p:'userMgmt',   ic:'\u2699',lbl:'User Mgmt'},
     {p:'calibration',ic:'\u2605',lbl:'Calibration'},
     {p:'promotions', ic:'\ud83c\udfc5',lbl:'Promotions'},
-    {p:'analytics',  ic:'\ud83d\udcca',lbl:'Performance Analytics'}
+    {p:'analytics',  ic:'\ud83d\udcca',lbl:'Performance Analytics'},
+    {p:'emailQueue', ic:'\u2709',lbl:'Email Queue'}
   ]});
   // History available to all
   secs.forEach(function(sec){
@@ -811,7 +814,7 @@ function loadPage(p){
   var pgs={dashboard:pgDash,myGoals:pgGoals,myReviews:pgReviews,
     teamGoals:pgTeamGoals,teamReviews:pgTeamReviews,approvals:pgApprovals,
     hrDashboard:pgHRDash,userMgmt:pgUserMgmt,hrReviews:pgHRReviews,
-    changeReqs:pgChangeReqs,
+    changeReqs:pgChangeReqs,emailQueue:pgEmailQueue,
     calibration:pgCalib,promotions:pgPromotions,analytics:pgAnalytics,
     reports:pgReports,employees:pgEmployees,history:pgHistory};
   if(pgs[p])pgs[p]();else setContent('<div class="empty">Page not found</div>');
@@ -1677,7 +1680,13 @@ function buildMonthlySummary(gs,mpMap,curFYM){
       kraCumul+=mAch;
     }
     kraCumul=Math.round(kraCumul*10)/10;
-    var kraExpected=curFYM*MONTHLY_TARGET;
+    // Score only against months with actual entries, not all elapsed months
+    var kraEntryMonths=0;
+    for(var m2=1;m2<=curFYM;m2++){
+      var hasAny=kpis.some(function(kpi){var e=mpMap[kpi.id]&&mpMap[kpi.id][m2];return e&&e.increment_ach!=null&&e.increment_ach>0;});
+      if(hasAny)kraEntryMonths++;
+    }
+    var kraExpected=kraEntryMonths*MONTHLY_TARGET;
     var kraIndPct=kraExpected>0?Math.round((kraCumul/kraExpected)*100*10)/10:null;
     var kraRt=kraIndPct!=null?getRating(kraIndPct):null;
 
@@ -1702,7 +1711,13 @@ function buildMonthlySummary(gs,mpMap,curFYM){
         kpiMonths.push(inc);
       }
       kpiCumul=Math.round(kpiCumul*10)/10;
-      var kpiExpected=curFYM*MONTHLY_TARGET;
+      // Score only against months with actual entries
+      var kpiEntryMonths=0;
+      for(var mk=1;mk<=curFYM;mk++){
+        var ek=mpMap[kpi.id]&&mpMap[kpi.id][mk];
+        if(ek&&ek.increment_ach!=null&&ek.increment_ach>0)kpiEntryMonths++;
+      }
+      var kpiExpected=kpiEntryMonths*MONTHLY_TARGET;
       var kpiIndPct=kpiExpected>0?Math.round((kpiCumul/kpiExpected)*100*10)/10:null;
       var kpiRt=kpiIndPct!=null?getRating(kpiIndPct):null;
       h+='<tr style="border-bottom:1px solid var(--g100)">'+
@@ -1719,7 +1734,17 @@ function buildMonthlySummary(gs,mpMap,curFYM){
   });
 
   overallCumul=Math.round(overallCumul*10)/10;
-  var overallExp=curFYM*MONTHLY_TARGET;
+  // For overall, find the max number of months any KPI has an entry
+  var overallEntryMonths=0;
+  for(var mo=1;mo<=curFYM;mo++){
+    var hasAnyKpi=false;
+    gs.kras.forEach(function(kra2){(kra2.kpis||[]).forEach(function(kpi2){
+      var e2=mpMap[kpi2.id]&&mpMap[kpi2.id][mo];
+      if(e2&&e2.increment_ach!=null&&e2.increment_ach>0)hasAnyKpi=true;
+    });});
+    if(hasAnyKpi)overallEntryMonths++;
+  }
+  var overallExp=overallEntryMonths*MONTHLY_TARGET;
   var overallIndPct=overallExp>0?Math.round((overallCumul/overallExp)*100*10)/10:null;
   var overallRt=overallIndPct!=null?getRating(overallIndPct):null;
 
@@ -1768,7 +1793,19 @@ function buildMonthlyEntryGrid(gs,mpMap,selMonth,readOnly,reviews){
       }
       prior=Math.round(prior*10)/10;
       var cumWithThis=prior+(inc!==''?parseFloat(inc)||0:0);
-      var expected=selMonth*MONTHLY_TARGET;
+      // Count months with actual entries up to and including selected month
+      var entryMonthCount=0;
+      for(var em2=1;em2<=selMonth;em2++){
+        var emE=mpMap[kpi.id]&&mpMap[kpi.id][em2];
+        if(emE&&emE.increment_ach!=null&&emE.increment_ach>0)entryMonthCount++;
+      }
+      // Also count the current entry if user is typing something
+      var curEntryHasVal=(inc!==''&&parseFloat(inc)>0);
+      if(curEntryHasVal){
+        var curME=mpMap[kpi.id]&&mpMap[kpi.id][selMonth];
+        if(!curME||!curME.increment_ach)entryMonthCount++;
+      }
+      var expected=entryMonthCount*MONTHLY_TARGET;
       var indPct=expected>0?Math.round((cumWithThis/expected)*100*10)/10:null;
       var indRt=indPct!=null?getRating(indPct):null;
 
@@ -3360,6 +3397,23 @@ function openHRGoalModal(empNo){
 }
 
 // ── HR DASHBOARD ──────────────────────────────────────────────
+function loadQueueStatus(){
+  var el=sel('cn-queue-stats');if(!el)return;
+  var rb=sel('cn-retry-btn');
+  xhr('GET','/api/notifications/queue-stats',null,function(err,data){
+    if(err||!data){if(el)el.innerHTML='<span style="color:var(--g400);font-size:11px">Queue stats unavailable</span>';return;}
+    var st=data.stats||{};
+    var cols=[{k:'pending',lbl:'Pending',col:'var(--amber)'},{k:'sending',lbl:'Sending',col:'var(--blue)'},{k:'sent',lbl:'Sent',col:'var(--green)'},{k:'failed',lbl:'Failed',col:'var(--red)'}];
+    var h=cols.map(function(c2){
+      return '<div style="text-align:center;padding:8px 16px;background:var(--g50);border-radius:6px;min-width:70px">'+
+        '<div style="font-size:20px;font-weight:700;color:'+c2.col+'">'+((st[c2.k])||0)+'</div>'+
+        '<div style="font-size:9px;color:var(--g500);margin-top:2px">'+c2.lbl+'</div></div>';
+    }).join('');
+    if(el)el.innerHTML=h;
+    if(rb){rb.style.display=(st.failed>0)?'inline-flex':'none';}
+  });
+}
+
 function pgHRDash(){
   xhr('GET','/api/cycle',null,function(ec,cycle){
     G.cycle=cycle||{goal_setting_open:1,mid_year_open:0,year_end_open:0};updateCyclePill();
@@ -3457,15 +3511,18 @@ function pgHRDash(){
         '<div style="font-size:10px;font-weight:700;color:var(--g500);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Custom Notification</div>'+
         '<div class="fg"><label class="fl">Send to</label>'+
         '<select class="fi" id="cn-target">'+
-        '<option value="all">All Employees (284)</option>'+
+        '<option value="all">All Employees</option>'+
         '<option value="pending_goals">Employees with pending goals</option>'+
         '<option value="pending_mid">Mid-year not submitted</option>'+
         '<option value="pending_ye">Year-end not submitted</option>'+
+        '<option value="individual">Specific Employee (enter below)</option>'+
         '<optgroup label="By Company">'+
         (s.by_company||[]).map(function(co){
           return'<option value="co:'+esc(co.company)+'">'+esc((co.company||'').replace(' (Private) Limited','').replace(' (Pvt) Ltd',''))+' ('+co.n+')</option>';
         }).join('')+
         '</optgroup></select></div>'+
+        '<div class="fg" id="cn-individual-wrap" style="display:none"><label class="fl">Employee Number</label>'+
+        '<input class="fi" id="cn-individual-emp" placeholder="Enter employee number e.g. 10045" type="number"></div>'+
         '<div class="fg"><label class="fl">Notification Type</label>'+
         '<select class="fi" id="cn-type">'+
         '<option value="goal_setting_opened">Goal Setting Opened</option>'+
@@ -3477,31 +3534,61 @@ function pgHRDash(){
         '</select></div>'+
         '<button class="btn btn-blue btn-sm" style="width:100%;margin-top:4px" id="cn-send-btn">\ud83d\udce7 Send Notification</button>'+
         '<div style="font-size:10px;color:var(--g400);margin-top:6px" id="cn-status"></div>'+
-        '</div></div></div>';
+        '</div></div>'+
+        // Email queue status panel
+        '<div class="card" style="margin-top:14px">'+
+        '<div style="font-size:12px;font-weight:700;color:var(--g800);margin-bottom:10px;display:flex;align-items:center;justify-content:space-between">'+
+        '<span>\ud83d\udce8 Email Queue Status <span style="font-size:10px;font-weight:400;color:var(--g500)">(last 7 days)</span></span>'+
+        '<button class="btn btn-sm" id="cn-retry-btn" style="display:none">Retry Failed</button></div>'+
+        '<div id="cn-queue-stats" style="display:flex;gap:10px;flex-wrap:wrap"></div>'+
+        '</div></div>';
 
       setContent(h);
       wirePhaseCards();
+
+      // Show/hide individual employee field
+      var cnTarget=sel('cn-target');
+      if(cnTarget)cnTarget.onchange=function(){
+        var wrap=sel('cn-individual-wrap');
+        if(wrap)wrap.style.display=this.value==='individual'?'block':'none';
+      };
 
       var cnBtn=sel('cn-send-btn');
       if(cnBtn)cnBtn.onclick=function(){
         var target=(sel('cn-target')||{}).value||'all';
         var type=(sel('cn-type')||{}).value||'deadline_reminder';
         var statusEl=sel('cn-status');
-        cnBtn.disabled=true;cnBtn.textContent='Sending\u2026';
+        // Individual employee
+        if(target==='individual'){
+          var empN=(sel('cn-individual-emp')||{}).value||'';
+          if(!empN.trim()){toast('Please enter an employee number','error');return;}
+          target=empN.trim();
+        }
+        cnBtn.disabled=true;cnBtn.textContent='Queueing\u2026';
         if(statusEl)statusEl.textContent='';
-        // Handle company target
-        var apiTarget=target;
-        if(target.startsWith('co:')){apiTarget=target.slice(3);}
+        var apiTarget=target.startsWith('co:')?target.slice(3):target;
         xhr('POST','/api/notifications/trigger',{type:type,target:apiTarget},function(err,res){
           cnBtn.disabled=false;cnBtn.textContent='\ud83d\udce7 Send Notification';
           if(err){toast(err,'error');if(statusEl)statusEl.textContent='\u2717 Error: '+err;return;}
-          var msg='\u2713 Sent to '+res.sent+' recipient'+(res.sent!==1?'s':'')+
-            (res.message?' \u2014 '+res.message:'');
+          var n=res.queued||res.sent||0;
+          var msg='\u2713 Queued for '+n+' recipient'+(n!==1?'s':'')+'. Emails delivering in background.';
           toast(msg,'ok');
           if(statusEl){statusEl.style.color='var(--green)';statusEl.textContent=msg;}
+          loadQueueStatus();
         });
       };
 
+      // Wire retry failed emails button
+      var retryBtn=sel('cn-retry-btn');
+      if(retryBtn)retryBtn.onclick=function(){
+        xhr('POST','/api/notifications/retry-failed',{},function(err,res){
+          if(err){toast(err,'error');return;}
+          toast('\u2713 Retrying '+res.retrying+' failed emails','ok');
+          setTimeout(loadQueueStatus,2000);
+        });
+      };
+      // Load queue status on dashboard open
+      setTimeout(loadQueueStatus,500);
       var pc=sel('btn-pub-calib');if(pc)pc.onclick=function(){G.calibLocked=!G.calibLocked;xhr('POST','/api/calibration/publish',{published:!G.calibLocked},function(){});toast(G.calibLocked?'Ratings locked \ud83d\udd12':'Ratings published \ud83d\udd13',G.calibLocked?'info':'ok');pgHRDash();};
       var gc=sel('btn-go-calib');if(gc)gc.onclick=function(){go('calibration');};
       var ba=sel('btn-bulk-act');if(ba)ba.onclick=function(){
@@ -4656,6 +4743,183 @@ function renderHistoryFor(empNo,empName,isOwn){
 }
 
 // ── PERFORMANCE ANALYTICS (HR) ───────────────────────────────────
+// EMAIL QUEUE PAGE
+function pgEmailQueue(){
+  G.eqStatus='all'; G.eqBatch=''; G.eqPage=0;
+  setContent('<div class="empty">Loading…</div>');
+  loadEQ();
+}
+
+function loadEQ(){
+  var qs='/api/notifications/queue?page='+G.eqPage;
+  if(G.eqStatus&&G.eqStatus!=='all')qs+='&status='+encodeURIComponent(G.eqStatus);
+  if(G.eqBatch)qs+='&batch_id='+encodeURIComponent(G.eqBatch);
+  xhr('GET',qs,null,function(err,d){
+    if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
+    d=d||{rows:[],total:0,counts:[],batches:[],page:0,pageSize:50};
+
+    var countMap={};
+    (d.counts||[]).forEach(function(c2){countMap[c2.status]=c2.n;});
+    var total30=Object.values(countMap).reduce(function(a,b){return a+b;},0);
+
+    // Status tabs
+    var tabs=[
+      {k:'all',   lbl:'All',     col:'var(--g600)', n:total30},
+      {k:'pending',lbl:'Pending', col:'var(--amber)', n:countMap.pending||0},
+      {k:'sending',lbl:'Sending', col:'var(--blue)',  n:countMap.sending||0},
+      {k:'sent',  lbl:'Sent',    col:'var(--green)', n:countMap.sent||0},
+      {k:'failed',lbl:'Failed',  col:'var(--red)',   n:countMap.failed||0},
+    ];
+
+    var h='<div style="margin-bottom:12px">'+
+      '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">'+
+      '<div style="font-size:18px;font-weight:700;color:var(--g900)">✉ Email Queue <span style="font-size:12px;font-weight:400;color:var(--g500)">(last 30 days)</span></div>'+
+      '<div style="display:flex;gap:8px">'+
+      (countMap.failed>0?'<button class="btn btn-sm btn-red" id="eq-retry-all">↺ Retry All Failed ('+countMap.failed+')</button>':'')+
+      '<button class="btn btn-sm" id="eq-refresh">↻ Refresh</button>'+
+      '</div></div>'+
+
+      // Summary cards
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'+
+      tabs.slice(1).map(function(t){
+        return '<div style="padding:12px 20px;background:#fff;border-radius:8px;border:1px solid var(--g200);min-width:90px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)">'+
+          '<div style="font-size:26px;font-weight:700;color:'+t.col+'">'+t.n+'</div>'+
+          '<div style="font-size:10px;color:var(--g500);margin-top:2px">'+t.lbl+'</div></div>';
+      }).join('')+
+      '</div>'+
+
+      // Filters
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'+
+      '<div class="tabs" style="flex:0 0 auto">'+
+      tabs.map(function(t){
+        return '<div class="tab'+(G.eqStatus===t.k?' active':'')+'" id="eq-tab-'+t.k+'" style="cursor:pointer">'+
+          '<span style="color:'+t.col+'">'+t.lbl+'</span>'+
+          (t.n>0?' <span style="font-size:10px;background:var(--g100);padding:1px 6px;border-radius:10px">'+t.n+'</span>':'')+
+          '</div>';
+      }).join('')+
+      '</div>'+
+      '<select class="fi" id="eq-batch-filter" style="flex:0 0 220px;font-size:11px">'+
+      '<option value="">All batches</option>'+
+      (d.batches||[]).map(function(b){
+        var label=b.batch_id.replace(/_\d+$/,'').replace(/_/g,' ');
+        var dt=b.queued_at?new Date(b.queued_at*1000).toLocaleDateString('en-GB'):'';
+        return '<option value="'+esc(b.batch_id)+'"'+(G.eqBatch===b.batch_id?' selected':'')+'>'+
+          esc(label)+' ('+dt+') — '+b.total+' emails</option>';
+      }).join('')+
+      '</select>'+
+      '<span style="font-size:11px;color:var(--g500)">'+d.total+' total</span>'+
+      '</div>'+
+      '</div>';
+
+    // Table
+    if(!d.rows.length){
+      h+='<div class="card" style="text-align:center;padding:40px;color:var(--g400)">✅ No emails in this view</div>';
+    } else {
+      h+='<div class="card" style="overflow:hidden"><div style="overflow-x:auto">'+
+        '<table class="tbl"><thead><tr>'+
+        '<th style="width:40px">#</th>'+
+        '<th>Recipient</th>'+
+        '<th>Subject</th>'+
+        '<th>Batch</th>'+
+        '<th>Status</th>'+
+        '<th>Attempts</th>'+
+        '<th>Queued</th>'+
+        '<th>Sent</th>'+
+        '<th>Error</th>'+
+        '<th>Actions</th>'+
+        '</tr></thead><tbody>';
+
+      d.rows.forEach(function(r,i){
+        var sc={pending:{col:'var(--amber)',bg:'#FFFBEB',lbl:'Pending'},
+                sending:{col:'var(--blue)',bg:'#EBF3FB',lbl:'Sending'},
+                sent:   {col:'var(--green)',bg:'#F0FDF4',lbl:'Sent'},
+                failed: {col:'var(--red)',bg:'#FEF2F2',lbl:'Failed'}}[r.status]||{col:'var(--g400)',bg:'#F9FAFB',lbl:r.status};
+        var batchLabel=(r.batch_id||'').replace(/_\d+$/,'').replace(/_/g,' ');
+        h+='<tr style="background:'+(i%2===0?'#fff':'var(--g50)')+'">'+
+          '<td style="font-size:10px;color:var(--g400)">'+r.id+'</td>'+
+          '<td><div style="font-size:12px;font-weight:500;color:var(--g900)">'+esc(r.to_email)+'</div>'+
+          (r.emp_no?'<div style="font-size:10px;color:var(--g400)">Emp: '+r.emp_no+'</div>':'')+
+          '</td>'+
+          '<td style="font-size:11px;color:var(--g700);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(r.subject)+'">'+esc(r.subject.replace('[Acorn PMS] ',''))+'</td>'+
+          '<td style="font-size:10px;color:var(--g500)">'+esc(batchLabel)+'</td>'+
+          '<td><span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;background:'+sc.bg+';color:'+sc.col+'">'+sc.lbl+'</span></td>'+
+          '<td style="font-size:11px;text-align:center;color:'+(r.attempts>=2?'var(--red)':'var(--g600)')+'">'+r.attempts+'</td>'+
+          '<td style="font-size:10px;color:var(--g500);white-space:nowrap">'+fmtD(r.queued_at)+'</td>'+
+          '<td style="font-size:10px;color:var(--g500);white-space:nowrap">'+(r.sent_at?fmtD(r.sent_at):'—')+'</td>'+
+          '<td style="font-size:10px;color:var(--red);max-width:160px;overflow:hidden;text-overflow:ellipsis" title="'+(r.last_error?esc(r.last_error):'')+'">'+
+          (r.last_error?esc(r.last_error.substring(0,60))+(r.last_error.length>60?'…':''):'—')+'</td>'+
+          '<td style="white-space:nowrap">'+
+          (r.status==='failed'?'<button class="btn btn-sm" id="eq-retry-'+i+'" style="margin-right:4px">↺ Retry</button>':'')+
+          '<button class="btn btn-sm btn-red" id="eq-del-'+i+'">✕</button>'+
+          '</td></tr>';
+      });
+      h+='</tbody></table></div></div>';
+
+      // Pagination
+      var totalPages=Math.ceil(d.total/d.pageSize);
+      if(totalPages>1){
+        h+='<div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-top:12px">'+
+          '<button class="btn btn-sm" id="eq-prev" '+(d.page===0?'disabled':'')+'>Prev</button>'+
+          '<span style="font-size:12px;color:var(--g500)">Page '+(d.page+1)+' of '+totalPages+'</span>'+
+          '<button class="btn btn-sm" id="eq-next" '+(d.page>=totalPages-1?'disabled':'')+'>Next</button>'+
+          '</div>';
+      }
+    }
+
+    setContent(h);
+
+    // Wire tabs
+    tabs.forEach(function(t){
+      var el=sel('eq-tab-'+t.k);
+      if(el)el.onclick=function(){G.eqStatus=t.k;G.eqPage=0;loadEQ();};
+    });
+
+    // Wire batch filter
+    var bf=sel('eq-batch-filter');
+    if(bf)bf.onchange=function(){G.eqBatch=this.value;G.eqPage=0;loadEQ();};
+
+    // Refresh
+    var refr=sel('eq-refresh');
+    if(refr)refr.onclick=loadEQ;
+
+    // Retry all failed
+    var retryAll=sel('eq-retry-all');
+    if(retryAll)retryAll.onclick=function(){
+      xhr('POST','/api/notifications/retry-failed',{},function(err,res){
+        if(err){toast(err,'error');return;}
+        toast('↺ Retrying '+res.retrying+' failed emails','ok');
+        setTimeout(loadEQ,1000);
+      });
+    };
+
+    // Pagination
+    var prev=sel('eq-prev'),next=sel('eq-next');
+    if(prev)prev.onclick=function(){G.eqPage--;loadEQ();};
+    if(next)next.onclick=function(){G.eqPage++;loadEQ();};
+
+    // Per-row actions
+    d.rows.forEach(function(r,i){
+      var retryBtn=sel('eq-retry-'+i);
+      if(retryBtn)retryBtn.onclick=(function(rid){return function(){
+        xhr('POST','/api/notifications/retry-one/'+rid,{},function(err){
+          if(err){toast(err,'error');return;}
+          toast('↺ Queued for retry','ok');
+          setTimeout(loadEQ,800);
+        });
+      };})(r.id);
+      var delBtn=sel('eq-del-'+i);
+      if(delBtn)delBtn.onclick=(function(rid,email){return function(){
+        if(!confirm('Delete this queue entry for '+email+'?'))return;
+        xhr('DELETE','/api/notifications/queue/'+rid,null,function(err){
+          if(err){toast(err,'error');return;}
+          toast('Deleted','info');
+          loadEQ();
+        });
+      };})(r.id,r.to_email);
+    });
+  });
+}
+
 function pgAnalytics(){
   xhr('GET','/api/analytics/ratings-by-cycle',null,function(err,cycles){
     if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}

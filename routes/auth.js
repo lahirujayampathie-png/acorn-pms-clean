@@ -70,26 +70,30 @@ router.post('/login', async (req, res) => {
   // Verify password
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
-    const newAttempts = user.failed_attempts + 1;
-    let lockUntil = null;
-    if (newAttempts >= MAX_ATTEMPTS) {
-      lockUntil = now + LOCK_SECONDS;
-    }
-    db.prepare(
-      'UPDATE users SET failed_attempts = ?, locked_until = ?, updated_at = ? WHERE emp_no = ?'
-    ).run(newAttempts, lockUntil, now, empNo);
+    // Atomic increment — avoids race condition when multiple requests hit simultaneously
+    const updated = db.prepare(`
+      UPDATE users
+      SET failed_attempts = failed_attempts + 1,
+          locked_until = CASE WHEN failed_attempts + 1 >= ? THEN ? ELSE locked_until END,
+          updated_at = ?
+      WHERE emp_no = ?
+    `).run(MAX_ATTEMPTS, now + LOCK_SECONDS, now, empNo);
+
+    // Re-read the updated state
+    const fresh = db.prepare('SELECT failed_attempts, locked_until FROM users WHERE emp_no=?').get(empNo);
+    const newAttempts = fresh.failed_attempts;
 
     db.logAudit(user.id, 'login_failed', 'auth', null,
       { emp_no: empNo, attempts: newAttempts }, req.ip);
 
-    const remaining = MAX_ATTEMPTS - newAttempts;
-    if (remaining <= 0) {
+    if (fresh.locked_until && fresh.locked_until > now) {
       return res.status(429).json({
         error: `Too many failed attempts. Account locked for 5 minutes.`
       });
     }
+    const remaining = MAX_ATTEMPTS - newAttempts;
     return res.status(401).json({
-      error: `Invalid password. ${remaining} attempt(s) remaining before lockout.`
+      error: `Invalid password.${remaining > 0 ? ` ${remaining} attempt(s) remaining before lockout.` : ' Account has been locked for 5 minutes.'}`
     });
   }
 
