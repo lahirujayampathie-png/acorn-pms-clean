@@ -560,9 +560,16 @@ function toggleNotifPanel(){
     }
     var data=Array.isArray(notifs)?notifs:[];
     G.notifs=data;
-    var unread=data.filter(function(n){return!n.is_read;}).length;
-    var badge=sel('notif-badge');
-    if(badge){badge.style.display=unread>0?'block':'none';badge.textContent=unread>9?'9+':String(unread);}
+    // Auto-mark all as read when panel opens — clears the badge immediately
+    var hasUnread=data.some(function(n){return!n.is_read;});
+    if(hasUnread){
+      xhr('PUT','/api/notifications/read',null,function(){
+        data.forEach(function(n){n.is_read=1;});
+        G.notifs=data;
+        var badge=sel('notif-badge');
+        if(badge)badge.style.display='none';
+      });
+    }
     renderNotifList(data);
   });
   setTimeout(function(){
@@ -3059,7 +3066,11 @@ function pgChangeReqs(){
     if(err){setContent('<div class="alert al-err">'+err+'</div>');return;}
     reqs=reqs||[];
     var pending=reqs.filter(function(r){return r.status==='pending'||r.status==='pending_hr';});
-    var reviewed=reqs.filter(function(r){return r.status!=='pending';});
+    // Fix: exclude pending_hr from history (was incorrectly included before)
+    var reviewed=reqs.filter(function(r){return r.status!=='pending'&&r.status!=='pending_hr';});
+    // Collect distinct cycles for the history filter
+    var cycles=[...new Set(reviewed.map(function(r){return r.cycle||'2026-27';}))].sort().reverse();
+    var selCycle=G._crHistoryCycle||(cycles[0]||'2026-27');
 
     function buildReqCard(cr,i,showActions){
       var sc={pending:{col:'var(--amber)',bg:'#FFFBEB',lbl:'Pending Supervisor'},
@@ -3111,12 +3122,17 @@ function pgChangeReqs(){
       pending.forEach(function(cr,i){ h+=buildReqCard(cr,i,true); });
     }
 
-    h+='<div style="font-size:13px;font-weight:700;color:var(--g800);margin:20px 0 8px">'+
-      'History <span style="font-size:11px;font-weight:400;color:var(--g500)">('+reviewed.length+')</span></div>';
-    if(!reviewed.length){
-      h+='<div class="card" style="text-align:center;padding:20px;color:var(--g400)">No reviewed requests yet</div>';
+    var filteredReviewed=reviewed.filter(function(r){return (r.cycle||'2026-27')===selCycle;});
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin:20px 0 8px">'+
+      '<div style="font-size:13px;font-weight:700;color:var(--g800)">History <span style="font-size:11px;font-weight:400;color:var(--g500)">('+filteredReviewed.length+' of '+reviewed.length+')</span></div>'+
+      (cycles.length>1?'<select id="cr-hist-cycle" style="font-size:11px;padding:4px 8px;border:1px solid var(--g200);border-radius:var(--r);color:var(--g700)">'+
+        cycles.map(function(c){return'<option value="'+esc(c)+'"'+(c===selCycle?' selected':'')+'>'+esc(c)+'</option>';}).join('')+
+      '</select>':'')+
+      '</div>';
+    if(!filteredReviewed.length){
+      h+='<div class="card" style="text-align:center;padding:20px;color:var(--g400)">No reviewed requests for '+esc(selCycle)+'</div>';
     } else {
-      reviewed.forEach(function(cr,i){ h+=buildReqCard(cr,pending.length+i,false); });
+      filteredReviewed.forEach(function(cr,i){ h+=buildReqCard(cr,pending.length+i,false); });
     }
 
     setContent(h);
@@ -3145,8 +3161,11 @@ function pgChangeReqs(){
         });
       };})(cr.emp_no,cr.id,i);
     });
+    // Wire history cycle filter
+    var cycleEl=sel('cr-hist-cycle');
+    if(cycleEl)cycleEl.onchange=function(){G._crHistoryCycle=this.value;pgChangeReqs();};
     // Wire history view buttons
-    reviewed.forEach(function(cr,i){
+    filteredReviewed.forEach(function(cr,i){
       var gsb=sel('hr-cr-gs-'+(pending.length+i));
       if(gsb)gsb.onclick=(function(en){return function(){openHRGoalModal(en);};})(cr.emp_no);
     });

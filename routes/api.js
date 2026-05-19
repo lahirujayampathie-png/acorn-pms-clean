@@ -1443,11 +1443,11 @@ router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
   const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
   if (!cr) return res.status(404).json({ error: 'Change request not found.' });
 
-  // HR can only act on pending_hr (post-mid-year awaiting HR sign-off)
+  // HR can approve/reject any pending or pending_hr request (override power)
   // Supervisor can only act on pending
-  if (isHRAdmin && !isSupervisor) {
-    if (cr.status !== 'pending_hr') {
-      return res.status(400).json({ error: 'This request is not awaiting HR approval.' });
+  if (isHRAdmin) {
+    if (cr.status !== 'pending' && cr.status !== 'pending_hr') {
+      return res.status(400).json({ error: 'This change request has already been reviewed.' });
     }
   } else {
     if (cr.status !== 'pending') {
@@ -1511,7 +1511,7 @@ router.post('/goals/:empNo/change-requests/:reqId/reject', (req, res) => {
   if (!comments || !comments.trim()) return res.status(400).json({error:'Please provide a reason for rejecting the change request.'});
   const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
   if (!cr) return res.status(404).json({error:'Change request not found.'});
-  if (cr.status !== 'pending') return res.status(400).json({error:'This change request has already been reviewed.'});
+  if (cr.status !== 'pending' && cr.status !== 'pending_hr') return res.status(400).json({error:'This change request has already been reviewed.'});
 
   const now = Math.floor(Date.now()/1000);
   db.prepare(`UPDATE goal_change_requests SET status='rejected',reviewed_at=?,reviewed_by=?,reviewer_comments=?,updated_at=? WHERE id=?`)
