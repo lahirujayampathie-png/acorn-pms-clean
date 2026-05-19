@@ -107,7 +107,17 @@ function initQueue(db) {
 }
 
 // Add emails to the queue — returns immediately
+// Checks both email.config SMTP_ENABLED and DB system_settings email_enabled
 function queueEmails(db, recipients, subject, htmlBody, batchId) {
+  if (!cfg.SMTP_ENABLED) return 0;
+  // Check DB kill switch
+  try {
+    const s = db.prepare("SELECT value FROM system_settings WHERE key='email_enabled'").get();
+    if (s && s.value !== '1') {
+      console.log(`  [Queue] Email disabled via admin toggle — skipping ${recipients.length} emails`);
+      return 0;
+    }
+  } catch(e) { /* system_settings may not exist yet — allow */ }
   const now = Math.floor(Date.now() / 1000);
   const insert = db.prepare(`
     INSERT INTO email_queue(emp_no, to_email, subject, html_body, status, attempts, queued_at, batch_id)
@@ -128,6 +138,11 @@ function queueEmails(db, recipients, subject, htmlBody, batchId) {
 async function processQueue() {
   if (!_db) return;
   if (!cfg.SMTP_ENABLED) return;
+  // Check DB kill switch before processing
+  try {
+    const s = _db.prepare("SELECT value FROM system_settings WHERE key='email_enabled'").get();
+    if (s && s.value !== '1') return; // admin has disabled email
+  } catch(e) { /* table may not exist yet */ }
 
   const BATCH = 10;   // process 10 at a time
   const MAX_ATTEMPTS = 3;

@@ -4,7 +4,7 @@
 
 module.exports = {
 
-  SMTP_ENABLED: true,
+  SMTP_ENABLED: false,
 
   SMTP_HOST:   'smtp.office365.com',
   SMTP_PORT:   587,

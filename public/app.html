@@ -3397,6 +3397,52 @@ function openHRGoalModal(empNo){
 }
 
 // ── HR DASHBOARD ──────────────────────────────────────────────
+function loadEmailToggleStatus(){
+  var panel=sel('email-toggle-panel');
+  var label=sel('email-status-label');
+  var sub=sel('email-status-sub');
+  var enableBtn=sel('email-enable-btn');
+  var disableBtn=sel('email-disable-btn');
+  var disableCancelBtn=sel('email-disable-cancel-btn');
+  if(!panel)return;
+  xhr('GET','/api/system/email-status',null,function(err,data){
+    if(err||!data){if(label)label.textContent='✉ Email Sending: Unknown';return;}
+    var on=data.enabled;
+    panel.style.border='2px solid '+(on?'var(--green)':'var(--red)');
+    panel.style.background=on?'#F0FDF4':'#FEF2F2';
+    if(label){
+      label.textContent=on?'✅ Email Sending: ENABLED':'⛔ Email Sending: DISABLED';
+      label.style.color=on?'var(--green)':'var(--red)';
+    }
+    if(sub)sub.textContent='Pending: '+(data.pending||0)+' · Sent last 24h: '+(data.sent24h||0);
+    if(enableBtn)enableBtn.style.display=on?'none':'inline-flex';
+    if(disableBtn)disableBtn.style.display=on?'inline-flex':'none';
+    if(disableCancelBtn)disableCancelBtn.style.display=on?'inline-flex':'none';
+    if(enableBtn)enableBtn.onclick=function(){
+      xhr('POST','/api/system/email-toggle',{enabled:true,cancel_pending:false},function(err){
+        if(err){toast(err,'error');return;}
+        toast('✅ Email sending ENABLED','ok');
+        loadEmailToggleStatus();loadQueueStatus();
+      });
+    };
+    if(disableBtn)disableBtn.onclick=function(){
+      xhr('POST','/api/system/email-toggle',{enabled:false,cancel_pending:false},function(err){
+        if(err){toast(err,'error');return;}
+        toast('⛔ Email sending DISABLED. Queued emails will not send until re-enabled.','warn');
+        loadEmailToggleStatus();
+      });
+    };
+    if(disableCancelBtn)disableCancelBtn.onclick=function(){
+      if(!confirm('Disable email AND cancel all '+data.pending+' pending emails in the queue? This cannot be undone.'))return;
+      xhr('POST','/api/system/email-toggle',{enabled:false,cancel_pending:true},function(err,res){
+        if(err){toast(err,'error');return;}
+        toast('⛔ Email DISABLED. Cancelled '+(res.cancelled||0)+' pending emails.','warn');
+        loadEmailToggleStatus();loadQueueStatus();
+      });
+    };
+  });
+}
+
 function loadQueueStatus(){
   var el=sel('cn-queue-stats');if(!el)return;
   var rb=sel('cn-retry-btn');
@@ -3486,6 +3532,19 @@ function pgHRDash(){
       h+='<div class="card" style="margin-top:14px">'+
         '<div class="card-title">\ud83d\udd14 Notification Center '+
         '<span class="card-sub">Send system notifications to employees</span></div>'+
+
+        // Email kill switch panel
+        '<div id="email-toggle-panel" style="margin-bottom:14px;padding:12px 16px;border-radius:8px;border:2px solid var(--g200);background:var(--g50);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'+
+        '<div>'+
+        '<div style="font-size:13px;font-weight:700;color:var(--g800)" id="email-status-label">\u2709 Email Sending: Checking...</div>'+
+        '<div style="font-size:11px;color:var(--g500);margin-top:2px" id="email-status-sub">Loading queue status...</div>'+
+        '</div>'+
+        '<div style="display:flex;gap:8px;align-items:center">'+
+        '<button class="btn btn-sm btn-green" id="email-enable-btn" style="display:none">\u25b6 Enable Email</button>'+
+        '<button class="btn btn-sm btn-red" id="email-disable-btn" style="display:none">\u23f8 Disable Email</button>'+
+        '<button class="btn btn-sm btn-red" id="email-disable-cancel-btn" style="display:none">\u23f8 Disable + Cancel Pending</button>'+
+        '</div></div>'+
+
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'+
 
         // Left — quick triggers
@@ -3589,6 +3648,8 @@ function pgHRDash(){
       };
       // Load queue status on dashboard open
       setTimeout(loadQueueStatus,500);
+      // Load email toggle status
+      loadEmailToggleStatus();
       var pc=sel('btn-pub-calib');if(pc)pc.onclick=function(){G.calibLocked=!G.calibLocked;xhr('POST','/api/calibration/publish',{published:!G.calibLocked},function(){});toast(G.calibLocked?'Ratings locked \ud83d\udd12':'Ratings published \ud83d\udd13',G.calibLocked?'info':'ok');pgHRDash();};
       var gc=sel('btn-go-calib');if(gc)gc.onclick=function(){go('calibration');};
       var ba=sel('btn-bulk-act');if(ba)ba.onclick=function(){

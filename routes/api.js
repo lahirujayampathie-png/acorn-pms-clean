@@ -60,6 +60,16 @@ router.use(verifyToken);   // All API routes require auth
   try { db.prepare('ALTER TABLE goal_change_requests ADD COLUMN sup_approved_by INTEGER').run(); } catch(e){}
   try { db.prepare('ALTER TABLE goal_change_requests ADD COLUMN sup_comments TEXT').run(); } catch(e){}
 
+  // System settings table — stores runtime toggles like email_enabled
+  db.prepare(`CREATE TABLE IF NOT EXISTS system_settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL,
+    updated_at INTEGER,
+    updated_by INTEGER
+  )`).run();
+  // Default: email enabled
+  db.prepare(`INSERT OR IGNORE INTO system_settings(key, value, updated_at) VALUES('email_enabled','1',strftime('%s','now'))`).run();
+
   // Reset stale failed_attempts on startup (prevent spurious lockouts after server restart)
   // Only clear if locked_until has already expired — active locks remain
   const now = Math.floor(Date.now()/1000);
@@ -2161,10 +2171,42 @@ router.put('/notifications/:id/read', (req, res) => {
   res.json({success:true});
 });
 
-// POST /api/notifications/trigger — HR manually triggers a notification
+// ── Email enabled check — reads from DB, overrides email.config.js ──────────
+function isEmailEnabled() {
+  try {
+    const s = db.prepare("SELECT value FROM system_settings WHERE key='email_enabled'").get();
+    return s ? s.value === '1' : true;
+  } catch(e) { return true; }
+}
+
+// GET /api/system/email-status — check current email toggle
+router.get('/system/email-status', requireHR, (req, res) => {
+  const enabled = isEmailEnabled();
+  const pending = (() => { try { return db.prepare("SELECT COUNT(*) as n FROM email_queue WHERE status='pending'").get().n; } catch(e){ return 0; } })();
+  const sent24h = (() => { try { return db.prepare("SELECT COUNT(*) as n FROM email_queue WHERE status='sent' AND sent_at > strftime('%s','now')-86400").get().n; } catch(e){ return 0; } })();
+  res.json({ enabled, pending, sent24h });
+});
+
+// POST /api/system/email-toggle — enable or disable email sending
+router.post('/system/email-toggle', requireHR, (req, res) => {
+  const { enabled, cancel_pending } = req.body;
+  const now = Math.floor(Date.now()/1000);
+  db.prepare("UPDATE system_settings SET value=?, updated_at=?, updated_by=? WHERE key='email_enabled'")
+    .run(enabled ? '1' : '0', now, req.user.emp_no);
+  // Optionally cancel all pending queue entries
+  let cancelled = 0;
+  if (!enabled && cancel_pending) {
+    const r = db.prepare("UPDATE email_queue SET status='cancelled' WHERE status='pending'").run();
+    cancelled = r.changes;
+  }
+  db.logAudit(req.user.id, enabled ? 'email_enabled' : 'email_disabled', 'system', null,
+    { cancelled_pending: cancelled }, req.ip);
+  res.json({ success: true, enabled, cancelled });
+});
 // Queues emails immediately and returns — no timeout regardless of recipient count
 router.post('/notifications/trigger', requireHR, async (req, res) => {
   const { type, target } = req.body;
+  const emailOn = isEmailEnabled();
   let recipients = [];
 
   try {
@@ -2213,7 +2255,10 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
       success: true,
       queued:  recipients.length,
       in_app:  recipients.length,
-      message: `Notifications queued for ${recipients.length} recipient(s). Emails will be delivered in the background.`
+      email_enabled: emailOn,
+      message: emailOn
+        ? `Notifications queued for ${recipients.length} recipient(s). Emails will be delivered in the background.`
+        : `In-app notifications sent to ${recipients.length} recipient(s). Email is currently DISABLED \u2014 no emails sent.`
     });
   } catch(e) {
     console.error('[notifications/trigger]', e);
@@ -2221,7 +2266,23 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
   }
 });
 
-// GET /api/notifications/queue-stats — HR sees email queue status
+// GET /api/debug/goal-sheets/:company — diagnostic: check for data inconsistencies
+router.get('/debug/goal-sheets/:company', requireHR, (req, res) => {
+  const company = decodeURIComponent(req.params.company);
+  const rows = db.prepare(`
+    SELECT u.emp_no, u.name, u.company, u.role,
+           COUNT(gs.id) as sheet_count,
+           GROUP_CONCAT(gs.id) as sheet_ids,
+           GROUP_CONCAT(gs.status) as statuses,
+           GROUP_CONCAT(gs.cycle) as cycles
+    FROM users u
+    LEFT JOIN goal_sheets gs ON gs.emp_no = u.emp_no
+    WHERE u.is_active=1 AND u.company=?
+    GROUP BY u.emp_no
+    ORDER BY u.name
+  `).all(company);
+  res.json(rows);
+});
 router.get('/notifications/queue-stats', requireHR, (req, res) => {
   try {
     const { getQueueStats } = require('../notifications');
