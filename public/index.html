@@ -236,36 +236,48 @@ html,body{height:100%;font-family:var(--font);overflow:hidden}
       <button class="back-btn" id="btn-back-forgot">&#8592; Back to Sign In</button>
       <div class="r-sys">Reset Password</div>
       <div class="r-title">Forgot Password?</div>
-      <p class="r-sub">HR will generate a reset token for you. Enter it below along with your employee number to set a new password.</p>
       <div class="err-box" id="fp-err"></div>
       <div class="ok-box" id="fp-ok"></div>
-      <div class="fg">
-        <label class="fl">Employee Number</label>
-        <div class="fw"><span class="fp">&#128100;</span>
-          <input class="fi" type="text" id="fp-emp" placeholder="Your employee number">
+
+      <!-- Step 1: request code -->
+      <div id="fp-step1">
+        <p class="r-sub">Enter your employee number and we&#8217;ll email you a reset code.</p>
+        <div class="fg">
+          <label class="fl">Employee Number</label>
+          <div class="fw"><span class="fp">&#128100;</span>
+            <input class="fi" type="text" id="fp-emp" placeholder="Your employee number" inputmode="numeric">
+          </div>
         </div>
+        <button class="btn-login" id="btn-send-code">Send Reset Code &rarr;</button>
+        <div class="lnk-row" style="margin-top:12px"><a id="lnk-have-code" style="font-size:12px;color:#6B7280;cursor:pointer">I already have a code &#8594;</a></div>
       </div>
-      <div class="fg">
-        <label class="fl">Reset Token (from HR Admin)</label>
-        <div class="fw"><span class="fp">&#128273;</span>
-          <input class="fi" type="text" id="fp-tok" placeholder="6-digit token e.g. 482913" maxlength="6" style="letter-spacing:.15em;font-size:16px;font-weight:600">
+
+      <!-- Step 2: enter code + new password (hidden until code is sent) -->
+      <div id="fp-step2" style="display:none">
+        <p class="r-sub" id="fp-step2-msg">Enter the 6-digit code from your email and choose a new password.</p>
+        <div class="fg">
+          <label class="fl">Reset Code</label>
+          <div class="fw"><span class="fp">&#128273;</span>
+            <input class="fi" type="text" id="fp-tok" placeholder="6-digit code" maxlength="6" style="letter-spacing:.2em;font-size:18px;font-weight:700" inputmode="numeric">
+          </div>
         </div>
-      </div>
-      <div class="fg">
-        <label class="fl">New Password</label>
-        <div class="fw">
-          <input class="fi fi-pw" type="password" id="fp-pw" placeholder="Min 8 chars · uppercase · number · symbol">
-          <button type="button" class="eye-btn" id="eye-fp" title="Show/hide"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+        <div class="fg">
+          <label class="fl">New Password</label>
+          <div class="fw">
+            <input class="fi fi-pw" type="password" id="fp-pw" placeholder="Min 8 chars · uppercase · number · symbol">
+            <button type="button" class="eye-btn" id="eye-fp" title="Show/hide"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          </div>
         </div>
-      </div>
-      <div class="fg">
-        <label class="fl">Confirm New Password</label>
-        <div class="fw">
-          <input class="fi fi-pw" type="password" id="fp-pw2" placeholder="Repeat new password">
-          <button type="button" class="eye-btn" id="eye-fp2" title="Show/hide"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+        <div class="fg">
+          <label class="fl">Confirm New Password</label>
+          <div class="fw">
+            <input class="fi fi-pw" type="password" id="fp-pw2" placeholder="Repeat new password">
+            <button type="button" class="eye-btn" id="eye-fp2" title="Show/hide"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          </div>
         </div>
+        <button class="btn-login" id="btn-reset">Reset Password &rarr;</button>
+        <div class="lnk-row" style="margin-top:12px"><a id="lnk-resend" style="font-size:12px;color:#6B7280;cursor:pointer">&#8592; Re-send code</a></div>
       </div>
-      <button class="btn-login" id="btn-reset">Reset Password &rarr;</button>
     </div>
 
     <!-- SET PASSWORD (first login) -->
@@ -357,16 +369,48 @@ document.getElementById('emp-no').addEventListener('keydown',function(e){
 });
 
 // ── FORGOT ──
-document.getElementById('lnk-forgot').addEventListener('click',function(){showPanel('p-forgot');});
-document.getElementById('btn-back-forgot').addEventListener('click',function(){showPanel('p-login');});
+function showForgotStep(step){
+  document.getElementById('fp-step1').style.display=step===1?'block':'none';
+  document.getElementById('fp-step2').style.display=step===2?'block':'none';
+  hideErr('fp-err');hideErr('fp-ok');
+}
 
+document.getElementById('lnk-forgot').addEventListener('click',function(){
+  showPanel('p-forgot');showForgotStep(1);
+});
+document.getElementById('btn-back-forgot').addEventListener('click',function(){
+  showPanel('p-login');showForgotStep(1);
+});
+document.getElementById('lnk-have-code').addEventListener('click',function(){
+  showForgotStep(2);
+  document.getElementById('fp-step2-msg').textContent='Enter the 6-digit code provided by HR and choose a new password.';
+});
+document.getElementById('lnk-resend').addEventListener('click',function(){showForgotStep(1);});
+
+// Step 1 — send reset code via email
+document.getElementById('btn-send-code').addEventListener('click',function(){
+  hideErr('fp-err');hideErr('fp-ok');
+  var empNo=document.getElementById('fp-emp').value.trim();
+  if(!empNo){showErr('fp-err','Please enter your employee number.');return;}
+  var btn=this;btn.textContent='Sending…';btn.disabled=true;
+  xhr('POST','/auth/forgot-password',{emp_no:empNo},function(err,data){
+    btn.innerHTML='Send Reset Code &rarr;';btn.disabled=false;
+    if(err){showErr('fp-err',err);return;}
+    showOk('fp-ok','Reset code sent! Check your email inbox (and spam folder). The code expires in 1 hour.');
+    document.getElementById('fp-step2-msg').textContent='Enter the 6-digit code from your email and choose a new password.';
+    showForgotStep(2);
+  });
+});
+
+// Step 2 — submit code + new password
 document.getElementById('btn-reset').addEventListener('click',function(){
   hideErr('fp-err');hideErr('fp-ok');
   var empNo=document.getElementById('fp-emp').value.trim();
   var tok=document.getElementById('fp-tok').value.trim();
   var pw=document.getElementById('fp-pw').value;
   var pw2=document.getElementById('fp-pw2').value;
-  if(!empNo||!tok){showErr('fp-err','Please enter your employee number and the reset token from HR.');return;}
+  if(!empNo){showErr('fp-err','Employee number is missing — go back and re-enter it.');return;}
+  if(!tok){showErr('fp-err','Please enter the reset code from your email.');return;}
   if(!pw||!pw2){showErr('fp-err','Please enter and confirm your new password.');return;}
   if(pw!==pw2){showErr('fp-err','Passwords do not match.');return;}
   if(pw.length<8){showErr('fp-err','Minimum 8 characters required.');return;}
@@ -378,7 +422,7 @@ document.getElementById('btn-reset').addEventListener('click',function(){
     btn.innerHTML='Reset Password &rarr;';btn.disabled=false;
     if(err){showErr('fp-err',err);return;}
     showOk('fp-ok','Password reset successfully! Redirecting to login…');
-    setTimeout(function(){showPanel('p-login');},2000);
+    setTimeout(function(){showPanel('p-login');showForgotStep(1);},2500);
   });
 });
 

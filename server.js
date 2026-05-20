@@ -28,6 +28,8 @@ async function startServer() {
 
   const loginLimiter = rateLimit({ windowMs:15*60*1000, max:10,
     message:{error:'Too many login attempts. Please wait 15 minutes.'} });
+  const forgotLimiter = rateLimit({ windowMs:60*60*1000, max:5,
+    message:{error:'Too many reset requests. Please try again in 1 hour.'} });
 
   app.use(express.json());
   app.use(express.urlencoded({ extended:true }));
@@ -47,6 +49,7 @@ async function startServer() {
   const authRouter = require('./routes/auth');
   // Rate limit only the login endpoint, not password change/reset
   app.use('/auth/login', loginLimiter);
+  app.use('/auth/forgot-password', forgotLimiter);
   app.use('/auth', authRouter);
   app.use('/api',   require('./routes/api'));
   app.use('/admin', require('./routes/admin'));

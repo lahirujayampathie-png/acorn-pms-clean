@@ -293,6 +293,76 @@ router.get('/me', verifyToken, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// POST /auth/forgot-password — self-service: emails reset token to employee
+// Public endpoint — no login required
+// ─────────────────────────────────────────────────────────────
+router.post('/forgot-password', async (req, res) => {
+  // Always return the same generic response to prevent user enumeration
+  const GENERIC_OK = { success: true, message: 'If your employee number has an email on file, a reset code has been sent. Check your inbox (and spam folder).' };
+  try {
+    const empNo = parseInt(req.body.emp_no);
+    if (isNaN(empNo)) return res.json(GENERIC_OK);
+
+    const user = db.prepare('SELECT * FROM users WHERE emp_no = ? AND is_active = 1').get(empNo);
+    if (!user || !user.email) return res.json(GENERIC_OK); // no email on file — silent fail
+
+    // Generate 6-digit token, valid for 1 hour
+    const token  = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = Math.floor(Date.now() / 1000) + (60 * 60);
+    const hash   = await bcrypt.hash(token, SALT_ROUNDS);
+
+    db.prepare('UPDATE users SET temp_token=?, temp_token_expiry=?, updated_at=? WHERE emp_no=?')
+      .run(hash, expiry, Math.floor(Date.now() / 1000), empNo);
+
+    db.logAudit(null, 'self_reset_requested', 'auth', null, { emp_no: empNo }, req.ip);
+
+    // Send email directly (transactional — bypasses queue for immediacy)
+    const cfg = require('../email.config');
+    if (cfg.SMTP_ENABLED) {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        host: cfg.SMTP_HOST, port: cfg.SMTP_PORT, secure: cfg.SMTP_SECURE,
+        auth: { user: cfg.SMTP_USER, pass: cfg.SMTP_PASS },
+        tls: { rejectUnauthorized: false }
+      });
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+        body{font-family:Arial,sans-serif;background:#F3F4F6;margin:0;padding:20px}
+        .wrap{max-width:520px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+        .hdr{background:#1B2A4A;padding:22px 32px;color:#fff}
+        .hdr h1{margin:0;font-size:18px;font-weight:700}
+        .body{padding:28px 32px;color:#374151;font-size:14px;line-height:1.6}
+        .code{font-size:36px;font-weight:800;letter-spacing:.2em;color:#1B2A4A;background:#F0F4FF;border:2px dashed #C7D2FE;border-radius:8px;padding:16px 24px;text-align:center;margin:20px 0}
+        .footer{background:#F9FAFB;padding:14px 32px;font-size:11px;color:#9CA3AF;border-top:1px solid #E5E7EB}
+      </style></head><body><div class="wrap">
+        <div class="hdr"><h1>${cfg.COMPANY_NAME} PMS — Password Reset</h1></div>
+        <div class="body">
+          <p>Hi ${user.name},</p>
+          <p>You requested a password reset for your Acorn PMS account. Use the code below on the login page:</p>
+          <div class="code">${token}</div>
+          <p style="font-size:12px;color:#6B7280">This code expires in <strong>1 hour</strong>. If you did not request this, please ignore this email — your account remains secure.</p>
+          <p style="font-size:12px;color:#6B7280">Go to the login page and click <strong>"Forgot password?"</strong> to use this code.</p>
+        </div>
+        <div class="footer">${cfg.COMPANY_NAME} &nbsp;·&nbsp; Performance Management System &nbsp;·&nbsp; This is an automated message — do not reply.</div>
+      </div></body></html>`;
+      await transporter.sendMail({
+        from: `"${cfg.FROM_NAME}" <${cfg.FROM_EMAIL}>`,
+        replyTo: cfg.REPLY_TO,
+        to: user.email,
+        subject: `[Acorn PMS] Your Password Reset Code — ${token}`,
+        html
+      });
+      console.log(`  [Auth] Password reset code sent to ${user.email}`);
+    }
+
+    res.json(GENERIC_OK);
+  } catch(err) {
+    console.error('  [Auth] Forgot-password error:', err.message);
+    // Still return generic success — don't expose server errors
+    res.json({ success: true, message: 'If your employee number has an email on file, a reset code has been sent. Check your inbox (and spam folder).' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
 // Password policy validator
 // ─────────────────────────────────────────────────────────────
 function validatePassword(pw) {
