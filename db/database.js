@@ -346,7 +346,18 @@ async function migrate() {
     ALTER TABLE goal_sheets ADD COLUMN change_count INTEGER DEFAULT 0;
     ALTER TABLE reviews ADD COLUMN pushback_at INTEGER;
     ALTER TABLE reviews ADD COLUMN pushback_by INTEGER;
-    ALTER TABLE reviews ADD COLUMN pushback_count INTEGER DEFAULT 0
+    ALTER TABLE reviews ADD COLUMN pushback_count INTEGER DEFAULT 0;
+    -- Normalise legacy short company names to full legal names
+    UPDATE users SET company='Acorn Air Services (Private) Limited'       WHERE company='Acorn Air Services (Pvt) Ltd';
+    UPDATE users SET company='Acorn Aviation (Private) Limited'           WHERE company='Acorn Aviation (Pvt) Ltd';
+    UPDATE users SET company='Acorn Insurance Brokers (Private) Limited'  WHERE company='Acorn Insurance Brokers (Pvt) Ltd';
+    UPDATE users SET company='Acorn Leisure (Private) Limited'            WHERE company='Acorn Leisure (Pvt) Ltd';
+    UPDATE users SET company='Acorn Partners (Private) Limited'           WHERE company='Acorn Partners (Pvt) Ltd';
+    UPDATE users SET company='Acorn Prime Destinations (Private) Limited' WHERE company='Acorn Prime Destinations (Pvt) Ltd';
+    UPDATE users SET company='Acorn Travels (Private) Limited'            WHERE company='Acorn Travels (Pvt) Ltd';
+    UPDATE users SET company='Acorn Ventures (Private) Limited'           WHERE company='Acorn Ventures (Pvt) Ltd';
+    UPDATE users SET company='Acorn Ventures (Private) Limited'           WHERE company='Acornic Ventures (Pvt) Ltd';
+    UPDATE users SET company='DTH Travel Lanka (Private) Limited'         WHERE company='DTH Travel Lanka (Pvt) Ltd'
   `;
   statements.split(';').map(s => s.trim()).filter(s => s.length > 0).forEach(stmt => {
     try { db.exec(stmt); } catch(e) { /* column may already exist */ }
