@@ -2235,7 +2235,24 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
         if (u) recipients = [u];
         else return res.status(404).json({ error: `Employee ${empNoInt} not found` });
       } else {
-        recipients = db.prepare("SELECT emp_no, email, name FROM users WHERE is_active=1 AND company=? AND role!='hr_admin'").all(target);
+        // Company target — apply same status filter as the phase-specific targets
+        if (type.includes('mid') || type === 'midyear_opened') {
+          recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+            JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
+            LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='mid_year'
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE, target);
+        } else if (type.includes('ye') || type.includes('yearend')) {
+          recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+            JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
+            LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE, target);
+        } else {
+          // Goal setting phase — exclude submitted and approved
+          recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
+            LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin'
+            AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE, target);
+        }
       }
     }
 
