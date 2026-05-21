@@ -2210,23 +2210,24 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
   let recipients = [];
 
   try {
+    const noPartners = `AND (u.company!='Acorn Partners (Private) Limited' OR u.emp_no=19683)`;
     if (target === 'all') {
-      recipients = db.prepare("SELECT emp_no, email, name FROM users WHERE is_active=1 AND role!='hr_admin'").all();
+      recipients = db.prepare(`SELECT emp_no, email, name FROM users u WHERE is_active=1 AND role!='hr_admin' ${noPartners}`).all();
     } else if (target === 'pending_goals') {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
-        WHERE u.is_active=1 AND u.role!='hr_admin'
+        WHERE u.is_active=1 AND u.role!='hr_admin' ${noPartners}
         AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE);
     } else if (target === 'pending_mid') {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
         LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='mid_year'
-        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE);
+        WHERE u.is_active=1 AND u.role!='hr_admin' ${noPartners} AND r.self_submitted_at IS NULL`).all(CYCLE);
     } else if (target === 'pending_ye') {
       recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
         JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
         LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
-        WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE);
+        WHERE u.is_active=1 AND u.role!='hr_admin' ${noPartners} AND r.self_submitted_at IS NULL`).all(CYCLE);
     } else if (target) {
       // Individual employee by emp_no OR company name
       const empNoInt = parseInt(target);
@@ -2240,17 +2241,17 @@ router.post('/notifications/trigger', requireHR, async (req, res) => {
           recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
             JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
             LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='mid_year'
-            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE, target);
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' ${noPartners} AND r.self_submitted_at IS NULL`).all(CYCLE, target);
         } else if (type.includes('ye') || type.includes('yearend')) {
           recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
             JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
             LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type='year_end'
-            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' AND r.self_submitted_at IS NULL`).all(CYCLE, target);
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' ${noPartners} AND r.self_submitted_at IS NULL`).all(CYCLE, target);
         } else {
           // Goal setting phase — exclude submitted and approved
           recipients = db.prepare(`SELECT u.emp_no, u.email, u.name FROM users u
             LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
-            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin'
+            WHERE u.is_active=1 AND u.company=? AND u.role!='hr_admin' ${noPartners}
             AND (gs.status IS NULL OR gs.status='draft')`).all(CYCLE, target);
         }
       }

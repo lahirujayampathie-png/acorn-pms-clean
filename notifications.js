@@ -390,11 +390,12 @@ async function runPhaseChecks(db) {
 
       if (!alreadySent) {
         let pending = [];
+        const partnerExclude = `AND (u.company!='Acorn Partners (Private) Limited' OR u.emp_no=19683)`;
         if (phase.key === 'gs') {
           pending = db.prepare(`
             SELECT u.emp_no, u.email, u.name FROM users u
             LEFT JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=?
-            WHERE u.is_active=1 AND u.role!='hr_admin'
+            WHERE u.is_active=1 AND u.role!='hr_admin' ${partnerExclude}
             AND (gs.id IS NULL OR gs.status IN ('draft','not_started'))
           `).all(CYCLE);
         } else {
@@ -403,7 +404,7 @@ async function runPhaseChecks(db) {
             SELECT u.emp_no, u.email, u.name FROM users u
             JOIN goal_sheets gs ON gs.emp_no=u.emp_no AND gs.cycle=? AND gs.status='approved'
             LEFT JOIN reviews r ON r.sheet_id=gs.id AND r.review_type=?
-            WHERE u.is_active=1 AND u.role!='hr_admin' AND r.self_submitted_at IS NULL
+            WHERE u.is_active=1 AND u.role!='hr_admin' ${partnerExclude} AND r.self_submitted_at IS NULL
           `).all(CYCLE, rt);
         }
 
