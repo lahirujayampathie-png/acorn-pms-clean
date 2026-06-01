@@ -2978,8 +2978,15 @@ function openAmendGoalModal(empNo){
       var m=document.createElement('div');m.className='modal-bg';
       m.onclick=function(e){if(e.target===m)m.remove();};
 
+      var isApproved=gs.status==='approved';
+
       function buildAmendHTML(){
-        var h='<div class="alert al-warn" style="margin-bottom:14px">\u270f You are amending the goals before approving. Only KRA/KPI names and weights can be changed. Changes will be saved and then you can approve.</div>';
+        var kraTotal=amendKRAs.reduce(function(s,k){return s+(k.kra_weight||0);},0);
+        var kraOk=Math.abs(kraTotal-100)<0.5;
+        var h=(isApproved
+          ?'<div class="alert al-info" style="margin-bottom:14px">\u270f You are amending <strong>approved</strong> goals. You can add, remove or edit KRAs and KPIs. The goals remain approved after saving.</div>'
+          :'<div class="alert al-warn" style="margin-bottom:14px">\u270f You are amending goals before approving. Add, remove or edit KRAs and KPIs, then save or approve.</div>');
+        h+='<div style="font-size:11px;margin-bottom:10px;color:'+(kraOk?'var(--green)':'var(--red)')+'">KRA total: '+Math.round(kraTotal*10)/10+'%'+(kraOk?' \u2713':' \u26a0 must equal 100%')+'</div>';
         amendKRAs.forEach(function(kra,ki){
           var kpiTotal=(kra.kpis||[]).reduce(function(s,k){return s+(k.kpi_weight||0);},0);
           var kpiOk=Math.abs(kpiTotal-100)<0.5;
@@ -2988,36 +2995,75 @@ function openAmendGoalModal(empNo){
             '<input class="fi" id="am-kra-nm-'+ki+'" value="'+esc(kra.kra_name)+'" style="flex:1;font-weight:600;font-size:12px">'+
             '<span style="font-size:11px;color:var(--g500)">Weight:</span>'+
             '<input type="number" class="fi" id="am-kra-wt-'+ki+'" value="'+kra.kra_weight+'" min="0" max="100" style="width:56px;text-align:center;font-weight:600;color:var(--blue-d);background:var(--blue-l);border-color:var(--blue-b)">'+
-            '<span style="font-size:11px;color:var(--g500)">%</span></div>'+
+            '<span style="font-size:11px;color:var(--g500)">%</span>'+
+            '<button class="btn btn-sm btn-red" id="am-del-kra-'+ki+'" title="Remove this KRA" style="padding:2px 8px;font-size:11px">\u2715 Remove</button></div>'+
             '<div class="kra-body">'+
-            '<div style="display:grid;grid-template-columns:1fr 66px;gap:6px;padding:6px 0 3px;border-bottom:1px solid var(--g200);margin-bottom:2px">'+
-            '<div class="kpi-ch" style="text-align:left">KPI Description</div><div class="kpi-ch">Weight%</div></div>';
+            '<div style="display:grid;grid-template-columns:1fr 66px 32px;gap:6px;padding:6px 0 3px;border-bottom:1px solid var(--g200);margin-bottom:2px">'+
+            '<div class="kpi-ch" style="text-align:left">KPI Description</div><div class="kpi-ch">Weight%</div><div></div></div>';
           (kra.kpis||[]).forEach(function(kpi,pi){
-            h+='<div style="display:grid;grid-template-columns:1fr 66px;gap:6px;align-items:center;padding:7px 0;border-bottom:1px solid var(--g100)">'+
+            h+='<div style="display:grid;grid-template-columns:1fr 66px 32px;gap:6px;align-items:center;padding:7px 0;border-bottom:1px solid var(--g100)">'+
               '<input class="fi" id="am-kpi-desc-'+ki+'-'+pi+'" value="'+esc(kpi.desc)+'" style="font-size:11px">'+
               '<input type="number" class="fi kpi-inp" id="am-kpi-wt-'+ki+'-'+pi+'" value="'+kpi.kpi_weight+'" min="0" max="100" style="text-align:center">'+
+              '<button class="btn btn-sm" id="am-del-kpi-'+ki+'-'+pi+'" title="Remove KPI" style="padding:2px 6px;font-size:12px;color:var(--red);border-color:var(--red)">\u2715</button>'+
               '</div>';
           });
           h+='<div style="font-size:11px;padding:6px 0;color:'+(kpiOk?'var(--green)':'var(--red)')+'">KPI weights: '+Math.round(kpiTotal*10)/10+'%'+(kpiOk?' \u2713':' \u26a0 must equal 100%')+'</div>'+
+          '<button class="btn btn-sm" id="am-add-kpi-'+ki+'" style="font-size:11px;margin-top:4px">+ Add KPI</button>'+
           '</div></div>';
         });
+        h+='<button class="btn btn-sm" id="am-add-kra" style="margin-top:6px;font-size:11px">+ Add KRA</button>';
         return h;
+      }
+
+      function wireAmendButtons(){
+        amendKRAs.forEach(function(kra,ki){
+          var delKra=sel('am-del-kra-'+ki);
+          if(delKra)delKra.onclick=function(){
+            collectAmends();
+            if(amendKRAs.length<=1){toast('At least one KRA is required','error');return;}
+            amendKRAs.splice(ki,1);
+            sel('am-body').innerHTML=buildAmendHTML();wireAmendButtons();
+          };
+          var addKpi=sel('am-add-kpi-'+ki);
+          if(addKpi)addKpi.onclick=function(){
+            collectAmends();
+            kra.kpis=kra.kpis||[];
+            kra.kpis.push({desc:'',kpi_weight:0,track_freq:'Monthly',assess_freq:'Quarterly'});
+            sel('am-body').innerHTML=buildAmendHTML();wireAmendButtons();
+          };
+          (kra.kpis||[]).forEach(function(kpi,pi){
+            var delKpi=sel('am-del-kpi-'+ki+'-'+pi);
+            if(delKpi)delKpi.onclick=function(){
+              collectAmends();
+              if((kra.kpis||[]).length<=1){toast('At least one KPI is required per KRA','error');return;}
+              kra.kpis.splice(pi,1);
+              sel('am-body').innerHTML=buildAmendHTML();wireAmendButtons();
+            };
+          });
+        });
+        var addKra=sel('am-add-kra');
+        if(addKra)addKra.onclick=function(){
+          collectAmends();
+          amendKRAs.push({kra_name:'New KRA',kra_weight:0,kpis:[{desc:'',kpi_weight:100,track_freq:'Monthly',assess_freq:'Quarterly'}]});
+          sel('am-body').innerHTML=buildAmendHTML();wireAmendButtons();
+        };
       }
 
       m.innerHTML='<div class="modal modal-lg">'+
         '<div class="mhead"><div style="display:flex;align-items:center;gap:10px">'+
         (emp?'<div class="av" style="background:'+avc(emp.emp_no)[0]+';color:'+avc(emp.emp_no)[1]+'">'+initials(emp.name)+'</div>':'')+
         '<div><div class="mtitle">Amend Goals \u2014 '+(emp?esc(emp.name):'Emp '+empNo)+'</div>'+
-        '<div style="font-size:11px;color:var(--g400)">Changes saved to DB. Employee will see updated goals after approval.</div></div></div>'+
+        '<div style="font-size:11px;color:var(--g400)">'+(isApproved?'Approved goals \u2014 changes take effect immediately.':'Changes saved to DB. Employee will see updated goals after approval.')+'</div></div></div>'+
         '<button class="mx" id="am-x">\u2715</button></div>'+
         '<div class="mbody" id="am-body">'+buildAmendHTML()+'</div>'+
         '<div class="mfoot">'+
         '<button class="btn" id="am-cls">Cancel</button>'+
-        '<button class="btn btn-sm" id="am-save-only">Save Changes</button>'+
-        '<button class="btn btn-green" id="am-save-appr">Save &amp; Approve \u2713</button>'+
+        '<button class="btn btn-blue" id="am-save-only">Save Changes \u2713</button>'+
+        (!isApproved?'<button class="btn btn-green" id="am-save-appr">Save &amp; Approve \u2713</button>':'')+
         '</div></div>';
       document.body.appendChild(m);
       sel('am-x').onclick=sel('am-cls').onclick=function(){m.remove();};
+      wireAmendButtons();
 
       function collectAmends(){
         amendKRAs.forEach(function(kra,ki){
@@ -3034,7 +3080,6 @@ function openAmendGoalModal(empNo){
 
       function doSave(thenApprove){
         collectAmends();
-        // Validate KRA weights
         var kraTotal=amendKRAs.reduce(function(s,k){return s+(k.kra_weight||0);},0);
         if(Math.abs(kraTotal-100)>0.5){toast('KRA weights must total 100% (currently '+Math.round(kraTotal*10)/10+'%)','error');return;}
         for(var i=0;i<amendKRAs.length;i++){
@@ -3043,18 +3088,19 @@ function openAmendGoalModal(empNo){
         }
         xhr('POST','/api/goals/'+empNo+'/amend',{kras:amendKRAs},function(err2){
           if(err2){toast(err2,'error');return;}
-          toast('Changes saved \u2713','ok');
           if(thenApprove){
             xhr('POST','/api/goals/'+empNo+'/approve',{comments:'Approved after amendment'},function(err3){
               if(err3){toast(err3,'error');return;}
               m.remove();G.team=null;toast('Goals amended and approved \u2713','ok');pgApprovals();renderNav();
             });
+          } else {
+            m.remove();G.team=null;toast('Goals amended \u2713','ok');pgApprovals();
           }
         });
       }
 
       sel('am-save-only').onclick=function(){doSave(false);};
-      sel('am-save-appr').onclick=function(){doSave(true);};
+      var sab=sel('am-save-appr');if(sab)sab.onclick=function(){doSave(true);};
     });
   });
 }

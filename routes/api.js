@@ -737,7 +737,7 @@ router.post('/calibration/publish', requireHR, (req, res) => {
   res.json({ success: true, published });
 });
 
-// POST /api/goals/:empNo/amend — supervisor amends KRA/KPI weights and descriptions before approving
+// POST /api/goals/:empNo/amend — supervisor amends KRAs/KPIs (submitted or approved)
 router.post('/goals/:empNo/amend', (req, res) => {
   const targetEmpNo = parseInt(req.params.empNo);
   const u = req.user;
@@ -748,20 +748,48 @@ router.post('/goals/:empNo/amend', (req, res) => {
   }
   const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no = ? AND cycle = ?').get(targetEmpNo, CYCLE);
   if (!sheet) return res.status(404).json({ error: 'No goal sheet found.' });
-  if (sheet.status !== 'submitted') {
-    return res.status(400).json({ error: 'Can only amend submitted goals.' });
+  if (sheet.status !== 'submitted' && sheet.status !== 'approved') {
+    return res.status(400).json({ error: 'Can only amend submitted or approved goals.' });
   }
   const now = Math.floor(Date.now()/1000);
-  (kras || []).forEach(kra => {
-    db.prepare('UPDATE kras SET kra_name = ?, kra_weight = ? WHERE id = ?')
-      .run(kra.kra_name, kra.kra_weight, kra.id);
-    (kra.kpis || []).forEach(kpi => {
-      db.prepare('UPDATE kpis SET desc = ?, kpi_weight = ?, updated_at = ? WHERE id = ?')
-        .run(kpi.desc, kpi.kpi_weight, now, kpi.id);
+  db.transaction(() => {
+    const existingKraIds = db.prepare('SELECT id FROM kras WHERE sheet_id=?').all(sheet.id).map(k => k.id);
+    const incomingKraIds = (kras||[]).filter(k=>k.id).map(k=>k.id);
+    // Delete removed KRAs and their KPIs/progress
+    existingKraIds.filter(id=>!incomingKraIds.includes(id)).forEach(id=>{
+      db.prepare('SELECT id FROM kpis WHERE kra_id=?').all(id).forEach(kpi=>{
+        db.prepare('DELETE FROM monthly_progress WHERE kpi_id=?').run(kpi.id);
+      });
+      db.prepare('DELETE FROM kpis WHERE kra_id=?').run(id);
+      db.prepare('DELETE FROM kras WHERE id=?').run(id);
     });
-  });
-  db.logAudit(u.id, 'goals_amended', 'goal_sheet', sheet.id, { emp_no: targetEmpNo }, req.ip);
-  res.json({ success: true });
+    (kras||[]).forEach((kra,ki)=>{
+      let kraId;
+      if(kra.id && existingKraIds.includes(kra.id)){
+        db.prepare('UPDATE kras SET kra_name=?,kra_weight=?,ref=? WHERE id=?').run(kra.kra_name,kra.kra_weight,ki+1,kra.id);
+        kraId=kra.id;
+      } else {
+        kraId=db.prepare('INSERT INTO kras(sheet_id,ref,kra_name,kra_weight,created_at) VALUES(?,?,?,?,?)').run(sheet.id,ki+1,kra.kra_name,kra.kra_weight,now).lastInsertRowid;
+      }
+      const existingKpiIds=db.prepare('SELECT id FROM kpis WHERE kra_id=?').all(kraId).map(k=>k.id);
+      const incomingKpiIds=(kra.kpis||[]).filter(k=>k.id).map(k=>k.id);
+      existingKpiIds.filter(id=>!incomingKpiIds.includes(id)).forEach(id=>{
+        db.prepare('DELETE FROM monthly_progress WHERE kpi_id=?').run(id);
+        db.prepare('DELETE FROM kpis WHERE id=?').run(id);
+      });
+      (kra.kpis||[]).forEach(kpi=>{
+        if(kpi.id && existingKpiIds.includes(kpi.id)){
+          db.prepare('UPDATE kpis SET desc=?,kpi_weight=?,updated_at=? WHERE id=?').run(kpi.desc,kpi.kpi_weight,now,kpi.id);
+        } else {
+          db.prepare('INSERT INTO kpis(kra_id,desc,track_freq,assess_freq,kpi_weight,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(kraId,kpi.desc,kpi.track_freq||'Monthly',kpi.assess_freq||'Quarterly',kpi.kpi_weight,now,now);
+        }
+      });
+    });
+    db.prepare('UPDATE goal_sheets SET updated_at=? WHERE id=?').run(now,sheet.id);
+  })();
+  db.logAudit(u.id,'goals_amended','goal_sheet',sheet.id,{emp_no:targetEmpNo,by:u.emp_no},req.ip);
+  db.saveToDisk();
+  res.json({success:true});
 });
 
 // POST /api/reviews/:empNo/release-feedback — release mid-year feedback to employee
