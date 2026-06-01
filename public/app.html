@@ -3534,7 +3534,7 @@ function pgHRDash(){
       var gs={}; (s.goal_stats||[]).forEach(function(g){gs[g.status]=g.n;});
       var c=G.cycle;
       var cos=[...new Set((s.by_company||[]).map(function(c){return c.company;}))];
-      var totalUsers=s.total_users||0;
+      var totalUsers=s.total_non_hr||s.total_users||0;
       var totalActivated=s.activated||0;
       var notActivated=totalUsers-totalActivated;
       var goalsApproved=gs.approved||0;
