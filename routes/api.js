@@ -1456,8 +1456,7 @@ router.post('/goals/:empNo/change-requests', (req, res) => {
 });
 
 // POST /api/goals/:empNo/change-requests/:reqId/approve — supervisor/HR approves change request
-// Option D: normal changes = supervisor approves, done.
-//           post-mid-year = supervisor approves → status becomes 'pending_hr' → HR must confirm.
+// Supervisor approval → immediately approved (accommodated). HR can also directly approve pending requests.
 router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
   const empNo = parseInt(req.params.empNo);
   const reqId = parseInt(req.params.reqId);
@@ -1471,52 +1470,29 @@ router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
   const cr = db.prepare('SELECT * FROM goal_change_requests WHERE id=? AND emp_no=?').get(reqId, empNo);
   if (!cr) return res.status(404).json({ error: 'Change request not found.' });
 
-  // HR can approve/reject any pending or pending_hr request (override power)
-  // Supervisor can only act on pending
-  if (isHRAdmin) {
-    if (cr.status !== 'pending' && cr.status !== 'pending_hr') {
-      return res.status(400).json({ error: 'This change request has already been reviewed.' });
-    }
-  } else {
-    if (cr.status !== 'pending') {
-      return res.status(400).json({ error: 'This change request has already been reviewed.' });
-    }
+  if (cr.status !== 'pending' && cr.status !== 'pending_hr') {
+    return res.status(400).json({ error: 'This change request has already been reviewed.' });
   }
 
   const now = Math.floor(Date.now()/1000);
 
-  // Post-mid-year + supervisor acting = move to pending_hr for HR sign-off
-  if (cr.is_post_midyear && isSupervisor && !isHRAdmin) {
+  // Supervisor approving → record sup_approved fields + fully approve (no HR sign-off step)
+  if (isSupervisor && !isHRAdmin) {
     db.prepare(`UPDATE goal_change_requests
-      SET status='pending_hr', sup_approved_at=?, sup_approved_by=?, sup_comments=?, updated_at=?
+      SET status='approved', sup_approved_at=?, sup_approved_by=?, sup_comments=?,
+          reviewed_at=?, updated_at=?
+      WHERE id=?`).run(now, req.user.emp_no, comments||'', now, now, reqId);
+  } else {
+    // HR directly approving
+    db.prepare(`UPDATE goal_change_requests
+      SET status='approved', reviewed_at=?, reviewed_by=?, reviewer_comments=?, updated_at=?
       WHERE id=?`).run(now, req.user.emp_no, comments||'', now, reqId);
-
-    db.logAudit(req.user.id,'goal_change_sup_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
-
-    // Notify HR to complete sign-off
-    try {
-      const hrUsers = db.prepare("SELECT emp_no, email FROM users WHERE role='hr_admin' AND is_active=1").all();
-      const empUser = db.prepare('SELECT name FROM users WHERE emp_no=?').get(empNo);
-      notify(db, 'goal_change_requested', hrUsers, {
-        emp_name: empUser?.name,
-        reason: cr.reason,
-        post_midyear: true,
-        supervisor_approved: true
-      }).catch(()=>{});
-    } catch(e) {}
-
-    return res.json({ success: true, pending_hr: true,
-      message: 'Supervisor approved. This is a post-mid-year change — HR sign-off required before employee can edit.' });
   }
 
-  // All other cases (normal change by supervisor, or HR approving pending_hr) = fully approved
   db.prepare("UPDATE goal_sheets SET status='approved',last_changed_at=?,change_count=COALESCE(change_count,0)+1,updated_at=? WHERE id=?")
     .run(now, now, cr.sheet_id);
-  db.prepare(`UPDATE goal_change_requests
-    SET status='approved', reviewed_at=?, reviewed_by=?, reviewer_comments=?, updated_at=? WHERE id=?`)
-    .run(now, req.user.emp_no, comments||'', now, reqId);
 
-  db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId},req.ip);
+  db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId,by_supervisor:isSupervisor},req.ip);
 
   // Notify employee
   try {
