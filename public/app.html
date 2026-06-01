@@ -3412,102 +3412,137 @@ function openJoinContextModal(empNo, empName){
 }
 
 function openHRGoalModal(empNo){
-  xhr('GET','/api/goals/'+empNo,null,function(err,gs){
-    xhr('GET','/api/employees/'+empNo,null,function(e2,emp){
-      xhr('GET','/api/goals/'+empNo+'/dev-goals',null,function(e3,devGoalsData){
-        xhr('GET','/api/goals/'+empNo+'/change-requests',null,function(e4,changeReqs){
-          if(err||!gs||!gs.kras){alert('No goal sheet found for this employee.');return;}
-          var m=document.createElement('div');m.className='modal-bg';
-          m.onclick=function(e){if(e.target===m)m.remove();};
+  // Parallel fetch all data needed for the modal
+  var results={};var done=0;var total=4;
+  function checkDone(){
+    done++;
+    if(done<total)return;
+    var gs=results.gs,emp=results.emp,devGoalsData=results.dg,changeReqs=results.cr;
+    if(!gs||!gs.kras){alert('No goal sheet found for this employee.');return;}
+    var m=document.createElement('div');m.className='modal-bg';
+    m.onclick=function(e){if(e.target===m)m.remove();};
 
-          var krasHTML='';
-          gs.kras.forEach(function(kra,ki){
-            krasHTML+='<div class="kra-block"><div class="kra-head" style="cursor:default">'+
-              '<div class="kra-n">'+(ki+1)+'</div><div class="kra-name">'+esc(kra.kra_name)+'</div>'+
-              '<span class="kra-wt">'+kra.kra_weight+'%</span></div>'+
-              '<div class="kra-body">';
-            (kra.kpis||[]).forEach(function(kpi){
-              krasHTML+='<div style="padding:10px 0;border-bottom:1px solid var(--g100)">'+
-                '<div style="font-size:12px;font-weight:500;color:var(--g800);margin-bottom:4px;white-space:pre-wrap;word-break:break-word">'+esc(kpi.desc)+'</div>'+
-                '<div style="display:flex;gap:16px;font-size:11px;color:var(--g500)">'+
-                '<span>Weight: <strong>'+kpi.kpi_weight+'%</strong></span>'+
-                (kpi.mid_ach!=null?'<span style="color:var(--blue)">Mid: <strong>'+kpi.mid_ach+'%</strong></span>':'')+
-                (kpi.end_ach!=null?'<span style="color:var(--green)">Year-End: <strong>'+kpi.end_ach+'%</strong></span>':'')+
-                '</div></div>';
-            });
-            krasHTML+='</div></div>';
-          });
-
-          // Dev goals section
-          var dgHTML='<div style="margin-top:18px"><div class="card-title" style="margin-bottom:8px">Personal Development Goals</div>';
-          var dgs=devGoalsData||[];
-          if(dgs.length){
-            dgs.forEach(function(dg){
-              dgHTML+='<div style="padding:8px 10px;background:var(--g50);border-radius:var(--r);margin-bottom:6px;font-size:12px">'+
-                '<div style="font-weight:500;color:var(--g800)">'+esc(dg.goal_text)+'</div>'+
-                (dg.target_date?'<div style="font-size:10px;color:var(--g400);margin-top:2px">Target: '+esc(dg.target_date)+'</div>':'')+
-                '</div>';
-            });
-          } else {
-            dgHTML+='<div style="font-size:11px;color:var(--g400);padding:8px 0">No development goals entered.</div>';
-          }
-          dgHTML+='</div>';
-
-          // Change requests section
-          var crHTML='';
-          var crs=changeReqs||[];
-          if(crs.length){
-            crHTML='<div style="margin-top:18px"><div class="card-title" style="margin-bottom:8px">Goal Change Requests</div>';
-            crs.forEach(function(cr){
-              var stCol=cr.status==='approved'?'var(--green)':cr.status==='rejected'?'var(--red)':'var(--amber)';
-              var stLbl=cr.status==='approved'?(cr.sup_approved_at&&!cr.reviewed_by?'Accommodated':'Attended'):cr.status==='rejected'?'Rejected':'Pending';
-              crHTML+='<div style="padding:8px 10px;background:var(--g50);border-radius:var(--r);margin-bottom:6px;font-size:11px;border-left:3px solid '+stCol+'">'+
-                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'+
-                '<span style="font-weight:600;color:'+stCol+'">'+stLbl+'</span>'+
-                '<span style="color:var(--g400)">'+fmtDT(cr.requested_at)+'</span></div>'+
-                '<div style="color:var(--g700)">'+esc(cr.reason)+'</div>'+
-                '</div>';
-            });
-            crHTML+='</div>';
-          }
-
-          m.innerHTML='<div class="modal modal-lg">'+
-            '<div class="mhead">'+
-            '<div style="display:flex;align-items:center;gap:10px">'+
-            (emp?'<div class="av" style="background:'+avc(emp.emp_no)[0]+';color:'+avc(emp.emp_no)[1]+'">'+initials(emp.name)+'</div>':'')+
-            '<div><div class="mtitle">Goal Sheet \u2014 '+(emp?esc(emp.name):'Emp '+empNo)+'</div>'+
-            '<div style="font-size:11px;color:var(--g400)">'+(emp?esc(emp.designation||'')+' \u00b7 '+esc(emp.company||''):'')+'</div></div>'+
-            '</div><button class="mx" id="hrgm-x">\u2715</button></div>'+
-            '<div class="mbody">'+
-            '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center">'+
-            '<span style="font-size:12px;color:var(--g600)">Status:</span> '+bdg(gs.status||'not_started')+
-            '<span style="font-size:12px;color:var(--g500);margin-left:8px">Cycle: <strong>'+esc(gs.cycle||'')+'</strong></span>'+
-            (gs.status==='approved'?'<button class="btn btn-sm" id="hrgm-unlock" style="margin-left:auto;color:var(--amber);border-color:var(--amber)">\ud83d\udd13 Unlock Goals</button>':'')+
-            '</div>'+
-            krasHTML+dgHTML+crHTML+
-            '</div>'+
-            '<div class="mfoot">'+
-            '<button class="btn" id="hrgm-cls">Close</button>'+
-            '<button class="btn btn-blue" id="hrgm-mid">\u2192 Open Mid-Year Review</button>'+
-            '<button class="btn btn-blue" id="hrgm-ye">\u2192 Open Year-End Review</button>'+
-            '</div></div>';
-          document.body.appendChild(m);
-          sel('hrgm-x').onclick=sel('hrgm-cls').onclick=function(){m.remove();};
-          sel('hrgm-mid').onclick=function(){m.remove();openSupervisorReviewModal(empNo,'mid');};
-          sel('hrgm-ye').onclick=function(){m.remove();openSupervisorReviewModal(empNo,'end');};
-          var ulBtn=sel('hrgm-unlock');
-          if(ulBtn)ulBtn.onclick=function(){
-            if(!confirm('Unlock this employee\'s goals so they can edit again?'))return;
-            xhr('POST','/api/goals/'+empNo+'/reopen',{},function(err2){
-              if(err2){toast(err2,'error');return;}
-              toast('\ud83d\udd13 Goals unlocked \u2014 employee can now edit','ok');
-              m.remove();
-            });
-          };
-        });
+    var krasHTML='';
+    gs.kras.forEach(function(kra,ki){
+      krasHTML+='<div class="kra-block"><div class="kra-head" style="cursor:default">'+
+        '<div class="kra-n">'+(ki+1)+'</div><div class="kra-name">'+esc(kra.kra_name)+'</div>'+
+        '<span class="kra-wt">'+kra.kra_weight+'%</span></div>'+
+        '<div class="kra-body">';
+      (kra.kpis||[]).forEach(function(kpi){
+        krasHTML+='<div style="padding:10px 0;border-bottom:1px solid var(--g100)">'+
+          '<div style="font-size:12px;font-weight:500;color:var(--g800);margin-bottom:4px;white-space:pre-wrap;word-break:break-word">'+esc(kpi.desc)+'</div>'+
+          '<div style="display:flex;gap:16px;font-size:11px;color:var(--g500)">'+
+          '<span>Weight: <strong>'+kpi.kpi_weight+'%</strong></span>'+
+          (kpi.mid_ach!=null?'<span style="color:var(--blue)">Mid: <strong>'+kpi.mid_ach+'%</strong></span>':'')+
+          (kpi.end_ach!=null?'<span style="color:var(--green)">Year-End: <strong>'+kpi.end_ach+'%</strong></span>':'')+
+          '</div></div>';
       });
+      krasHTML+='</div></div>';
     });
-  });
+
+    // Dev goals section
+    var dgHTML='<div style="margin-top:18px"><div class="card-title" style="margin-bottom:8px">Personal Development Goals</div>';
+    var dgs=devGoalsData||[];
+    if(dgs.length){
+      dgs.forEach(function(dg){
+        dgHTML+='<div style="padding:8px 10px;background:var(--g50);border-radius:var(--r);margin-bottom:6px;font-size:12px">'+
+          '<div style="font-weight:500;color:var(--g800)">'+esc(dg.goal_text)+'</div>'+
+          (dg.target_date?'<div style="font-size:10px;color:var(--g400);margin-top:2px">Target: '+esc(dg.target_date)+'</div>':'')+
+          '</div>';
+      });
+    } else {
+      dgHTML+='<div style="font-size:11px;color:var(--g400);padding:8px 0">No development goals entered.</div>';
+    }
+    dgHTML+='</div>';
+
+    // Change requests section \u2014 with approve/reject for pending requests
+    var crs=changeReqs||[];
+    var pendingCrs=crs.filter(function(c){return c.status==='pending'||c.status==='pending_hr';});
+    var crHTML='<div style="margin-top:18px"><div class="card-title" style="margin-bottom:8px">Goal Change Requests</div>';
+    if(!crs.length){
+      crHTML+='<div style="font-size:11px;color:var(--g400);padding:8px 0">No change requests.</div>';
+    } else {
+      crs.forEach(function(cr,cri){
+        var isPending=cr.status==='pending'||cr.status==='pending_hr';
+        var stCol=isPending?'var(--amber)':cr.status==='approved'?'var(--green)':'var(--red)';
+        var stLbl=isPending?'Pending':cr.status==='approved'?(cr.sup_approved_at&&!cr.reviewed_by?'Accommodated':'Attended'):'Rejected';
+        crHTML+='<div style="padding:10px 12px;background:var(--g50);border-radius:var(--r);margin-bottom:8px;border-left:3px solid '+stCol+'">'+
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'+
+          '<span style="font-weight:600;font-size:11px;color:'+stCol+'">'+stLbl+'</span>'+
+          '<span style="font-size:10px;color:var(--g400)">'+fmtDT(cr.requested_at)+'</span></div>'+
+          '<div style="font-size:12px;color:var(--g700);margin-bottom:'+(isPending?'8px':'0')+'">'+esc(cr.reason)+'</div>'+
+          (isPending?
+            '<textarea class="fi" id="hrgm-cr-cmt-'+cri+'" rows="2" placeholder="Comments (required for rejection)\u2026" style="font-size:11px;margin-bottom:6px"></textarea>'+
+            '<div style="display:flex;gap:6px">'+
+            '<button class="btn btn-sm btn-green" id="hrgm-cr-app-'+cri+'">\u2713 Approve</button>'+
+            '<button class="btn btn-sm btn-red" id="hrgm-cr-rej-'+cri+'">\u2717 Reject</button>'+
+            '</div>':'')+
+          '</div>';
+      });
+    }
+    crHTML+='</div>';
+
+    m.innerHTML='<div class="modal modal-lg">'+
+      '<div class="mhead">'+
+      '<div style="display:flex;align-items:center;gap:10px">'+
+      (emp?'<div class="av" style="background:'+avc(emp.emp_no)[0]+';color:'+avc(emp.emp_no)[1]+'">'+initials(emp.name)+'</div>':'')+
+      '<div><div class="mtitle">Goal Sheet \u2014 '+(emp?esc(emp.name):'Emp '+empNo)+'</div>'+
+      '<div style="font-size:11px;color:var(--g400)">'+(emp?esc(emp.designation||'')+' \u00b7 '+esc(emp.company||''):'')+'</div></div>'+
+      '</div><button class="mx" id="hrgm-x">\u2715</button></div>'+
+      '<div class="mbody">'+
+      '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center">'+
+      '<span style="font-size:12px;color:var(--g600)">Status:</span> '+bdg(gs.status||'not_started')+
+      '<span style="font-size:12px;color:var(--g500);margin-left:8px">Cycle: <strong>'+esc(gs.cycle||'')+'</strong></span>'+
+      (gs.status==='approved'?'<button class="btn btn-sm" id="hrgm-unlock" style="margin-left:auto;color:var(--amber);border-color:var(--amber)">\ud83d\udd13 Unlock Goals</button>':'')+
+      '</div>'+
+      krasHTML+dgHTML+crHTML+
+      '</div>'+
+      '<div class="mfoot">'+
+      '<button class="btn" id="hrgm-cls">Close</button>'+
+      '<button class="btn btn-blue" id="hrgm-mid">\u2192 Open Mid-Year Review</button>'+
+      '<button class="btn btn-blue" id="hrgm-ye">\u2192 Open Year-End Review</button>'+
+      '</div></div>';
+    document.body.appendChild(m);
+    sel('hrgm-x').onclick=sel('hrgm-cls').onclick=function(){m.remove();};
+    sel('hrgm-mid').onclick=function(){m.remove();openSupervisorReviewModal(empNo,'mid');};
+    sel('hrgm-ye').onclick=function(){m.remove();openSupervisorReviewModal(empNo,'end');};
+    var ulBtn=sel('hrgm-unlock');
+    if(ulBtn)ulBtn.onclick=function(){
+      if(!confirm('Unlock this employee\'s goals so they can edit again?'))return;
+      xhr('POST','/api/goals/'+empNo+'/reopen',{},function(err2){
+        if(err2){toast(err2,'error');return;}
+        toast('\ud83d\udd13 Goals unlocked \u2014 employee can now edit','ok');
+        m.remove();
+      });
+    };
+    // Wire change request approve/reject buttons
+    crs.forEach(function(cr,cri){
+      if(cr.status!=='pending'&&cr.status!=='pending_hr')return;
+      var appBtn=sel('hrgm-cr-app-'+cri);
+      var rejBtn=sel('hrgm-cr-rej-'+cri);
+      if(appBtn)appBtn.onclick=function(){
+        var cmt=(sel('hrgm-cr-cmt-'+cri)||{}).value||'';
+        xhr('POST','/api/goals/'+empNo+'/change-requests/'+cr.id+'/approve',{comments:cmt},function(err3){
+          if(err3){toast(err3,'error');return;}
+          toast('\u2713 Change request approved \u2014 employee can now edit','ok');
+          m.remove();
+        });
+      };
+      if(rejBtn)rejBtn.onclick=function(){
+        var cmt=(sel('hrgm-cr-cmt-'+cri)||{}).value||'';
+        if(!cmt.trim()){toast('Please provide a reason for rejecting','error');return;}
+        xhr('POST','/api/goals/'+empNo+'/change-requests/'+cr.id+'/reject',{comments:cmt},function(err3){
+          if(err3){toast(err3,'error');return;}
+          toast('Change request rejected','info');
+          m.remove();
+        });
+      };
+    });
+  }
+  xhr('GET','/api/goals/'+empNo,null,function(e,d){results.gs=d;checkDone();});
+  xhr('GET','/api/employees/'+empNo,null,function(e,d){results.emp=d;checkDone();});
+  xhr('GET','/api/goals/'+empNo+'/dev-goals',null,function(e,d){results.dg=d;checkDone();});
+  xhr('GET','/api/goals/'+empNo+'/change-requests',null,function(e,d){results.cr=d;checkDone();});
 }
 
 // ── HR DASHBOARD ──────────────────────────────────────────────
