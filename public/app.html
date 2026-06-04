@@ -3418,7 +3418,38 @@ function openHRGoalModal(empNo){
     done++;
     if(done<total)return;
     var gs=results.gs,emp=results.emp,devGoalsData=results.dg,changeReqs=results.cr;
-    if(!gs||!gs.kras){alert('No goal sheet found for this employee.');return;}
+    if(!gs||!gs.kras){
+      // No goal sheet yet — show info modal with unlock option
+      var m=document.createElement('div');m.className='modal-bg';
+      m.onclick=function(e){if(e.target===m)m.remove();};
+      m.innerHTML='<div class="modal">'+
+        '<div class="mhead">'+
+        '<div style="display:flex;align-items:center;gap:10px">'+
+        (emp?'<div class="av" style="background:'+avc(emp.emp_no)[0]+';color:'+avc(emp.emp_no)[1]+'">'+initials(emp.name)+'</div>':'')+
+        '<div><div class="mtitle">'+(emp?esc(emp.name):'Emp #'+empNo)+'</div>'+
+        '<div style="font-size:11px;color:var(--g400)">'+(emp?esc(emp.designation||'')+' · '+esc(emp.company||''):'')+'</div></div>'+
+        '</div><button class="mx" id="hrgm-ns-x">✕</button></div>'+
+        '<div class="mbody">'+
+        '<div style="padding:24px 0;text-align:center">'+
+        '<div style="font-size:36px;margin-bottom:10px">📄</div>'+
+        '<div style="font-size:14px;font-weight:600;color:var(--g700);margin-bottom:6px">No goal sheet found</div>'+
+        '<div style="font-size:12px;color:var(--g500);margin-bottom:20px">This employee has not started goal setting yet for the current cycle.<br>You can unlock goal setting so they can begin.</div>'+
+        '<button class="btn" id="hrgm-ns-unlock" style="color:var(--amber);border-color:var(--amber);padding:8px 20px">🔓 Unlock Goal Setting</button>'+
+        '</div></div>'+
+        '<div class="mfoot"><button class="btn" id="hrgm-ns-cls">Close</button></div></div>';
+      document.body.appendChild(m);
+      sel('hrgm-ns-x').onclick=sel('hrgm-ns-cls').onclick=function(){m.remove();};
+      sel('hrgm-ns-unlock').onclick=function(){
+        var empName=(emp&&emp.name)||('Employee #'+empNo);
+        if(!confirm('Unlock goal setting for '+empName+'? They will be able to create and submit goals.'))return;
+        xhr('POST','/api/goals/'+empNo+'/unlock-setting',{},function(err2){
+          if(err2){toast(err2,'error');return;}
+          toast('🔓 Goal setting unlocked — '+empName+' can now set goals','ok');
+          m.remove();
+        });
+      };
+      return;
+    }
     var m=document.createElement('div');m.className='modal-bg';
     m.onclick=function(e){if(e.target===m)m.remove();};
 
@@ -3493,7 +3524,7 @@ function openHRGoalModal(empNo){
       '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center">'+
       '<span style="font-size:12px;color:var(--g600)">Status:</span> '+bdg(gs.status||'not_started')+
       '<span style="font-size:12px;color:var(--g500);margin-left:8px">Cycle: <strong>'+esc(gs.cycle||'')+'</strong></span>'+
-      (gs.status==='approved'?'<button class="btn btn-sm" id="hrgm-unlock" style="margin-left:auto;color:var(--amber);border-color:var(--amber)">\ud83d\udd13 Unlock Goals</button>':'')+
+      '<button class="btn btn-sm" id="hrgm-unlock" style="margin-left:auto;color:var(--amber);border-color:var(--amber)">\ud83d\udd13 Unlock Goals</button>'+
       '</div>'+
       krasHTML+dgHTML+crHTML+
       '</div>'+
@@ -3508,10 +3539,11 @@ function openHRGoalModal(empNo){
     sel('hrgm-ye').onclick=function(){m.remove();openSupervisorReviewModal(empNo,'end');};
     var ulBtn=sel('hrgm-unlock');
     if(ulBtn)ulBtn.onclick=function(){
-      if(!confirm('Unlock this employee\'s goals so they can edit again?'))return;
-      xhr('POST','/api/goals/'+empNo+'/reopen',{},function(err2){
+      var empName=(emp&&emp.name)||('Employee #'+empNo);
+      if(!confirm('Unlock goals for '+empName+'? Their sheet will be set back to draft so they can edit again.'))return;
+      xhr('POST','/api/goals/'+empNo+'/unlock-setting',{},function(err2){
         if(err2){toast(err2,'error');return;}
-        toast('\ud83d\udd13 Goals unlocked \u2014 employee can now edit','ok');
+        toast('\ud83d\udd13 Goals unlocked \u2014 '+empName+' can now edit','ok');
         m.remove();
       });
     };
@@ -3618,7 +3650,7 @@ function pgHRDash(){
       var gs={}; (s.goal_stats||[]).forEach(function(g){gs[g.status]=g.n;});
       var c=G.cycle;
       var cos=[...new Set((s.by_company||[]).map(function(c){return c.company;}))];
-      var totalUsers=s.total_non_hr||s.total_users||0;
+      var totalUsers=s.total_users||0;
       var totalActivated=s.activated||0;
       var notActivated=totalUsers-totalActivated;
       var goalsApproved=gs.approved||0;

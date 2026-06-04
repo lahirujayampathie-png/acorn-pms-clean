@@ -433,6 +433,24 @@ router.post('/goals/:empNo/reopen', requireRole('hr_admin'), (req, res) => {
   res.json({ success: true });
 });
 
+// POST /api/goals/:empNo/unlock-setting — HR unlocks goal setting for a specific employee
+// Works whether they already have a sheet (reopens to draft) or not (creates empty draft)
+router.post('/goals/:empNo/unlock-setting', requireRole('hr_admin'), (req, res) => {
+  const targetEmpNo = parseInt(req.params.empNo);
+  const sheet = db.prepare('SELECT * FROM goal_sheets WHERE emp_no=? AND cycle=?').get(targetEmpNo, CYCLE);
+  const now = Math.floor(Date.now() / 1000);
+  if (sheet) {
+    db.prepare('UPDATE goal_sheets SET status=?, updated_at=? WHERE id=?').run('draft', now, sheet.id);
+    db.logAudit(req.user.id, 'goals_unlocked', 'goal_sheet', sheet.id, { emp_no: targetEmpNo, by: req.user.emp_no }, req.ip);
+  } else {
+    const result = db.prepare(
+      'INSERT INTO goal_sheets(emp_no, cycle, status, created_at, updated_at) VALUES(?,?,?,?,?)'
+    ).run(targetEmpNo, CYCLE, 'draft', now, now);
+    db.logAudit(req.user.id, 'goal_setting_unlocked', 'goal_sheet', result.lastInsertRowid, { emp_no: targetEmpNo, by: req.user.emp_no }, req.ip);
+  }
+  res.json({ success: true });
+});
+
 // POST /api/goals/:empNo/reset — HR deletes goal sheet entirely so employee can start fresh
 router.post('/goals/:empNo/reset', requireRole('hr_admin'), (req, res) => {
   const targetEmpNo = parseInt(req.params.empNo);
@@ -1489,7 +1507,9 @@ router.post('/goals/:empNo/change-requests/:reqId/approve', (req, res) => {
       WHERE id=?`).run(now, req.user.emp_no, comments||'', now, reqId);
   }
 
-  db.prepare("UPDATE goal_sheets SET status='approved',last_changed_at=?,change_count=COALESCE(change_count,0)+1,updated_at=? WHERE id=?")
+  // Set sheet back to 'draft' so the employee can now amend their goals.
+  // Once they re-submit the edited goals the supervisor approves again.
+  db.prepare("UPDATE goal_sheets SET status='draft',last_changed_at=?,change_count=COALESCE(change_count,0)+1,updated_at=? WHERE id=?")
     .run(now, now, cr.sheet_id);
 
   db.logAudit(req.user.id,'goal_change_approved','goal_sheet',cr.sheet_id,{req_id:reqId,by_supervisor:isSupervisor},req.ip);
